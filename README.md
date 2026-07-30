@@ -1,4 +1,4 @@
-# CS2 InventorySimulator 配套插件
+# 为完善CS2 InventorySimulator 和 CS2-Bot-Improver 功能而开发的两个插件
 
 > **这不是外挂。** 所有功能仅限本地自建房使用，无法在官方服务器或社区服务器生效。用途：装高手、整蛊朋友😂。
 
