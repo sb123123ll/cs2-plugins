@@ -14,7 +14,7 @@
 ## 重要：请搭配 InventorySimulator 和 CS2-Bot-Improver 使用
 如果你没下，那就去https://github.com/ed0ard/CS2-Bot-Improver 和 https://github.com/ianlucas/cs2-inventory-simulator
 
-**换个说法，本插件就是为了这两个插件而开发的。解决了InventorySimulator不能自定义暗金计数器击杀数的弊端，并且加入了本地上的无敌透视和防闪光白屏功能，防止你被增强人机打红温。或者你也可以用它来录个视频装高手、整蛊朋友😂**
+**换个说法，本插件就是为了这两个插件而开发的。解决了InventorySimulator不能自定义暗金计数器击杀数的弊端（仅限当局，新开可以重新输入指令），并且加入了本地上的无敌透视和防闪光白屏功能，防止你被增强人机打红温。或者你也可以用它来录个视频装高手、整蛊朋友😂**
 ---
 
 ## 环境要求
@@ -22,7 +22,7 @@
 - **[CounterStrikeSharp](https://github.com/roflmuffin/CounterStrikeSharp/releases)**（MinimumApiVersion 80+）
   - 安装到 CS2 的 `game/csgo/` 目录
 - **[InventorySimulator](https://github.com/ianlucas/cs2-inventory-simulator)**（本插件为此开发）
-  - 启用皮肤和暗金武器后，`!st` 才能真正在刀面/枪身上看到效果
+  - 给它赋予了暗金计数修改功能
 - **[CS2-Bot-Improver](https://github.com/ed0ard/CS2-Bot-Improver)**（本插件为此开发）
 (以上所说的两个插件安装好之后。直接粘贴并替换进 CS2 的 `game/csgo/` 目录）
 
@@ -66,8 +66,8 @@ game/csgo/addons/counterstrikesharp/plugins/
 ## 声明
 
 - **不是外挂，不是作弊器。** 所有功能依赖 CounterStrikeSharp 服务端插件框架，仅本地自建房有效。
-- 官方服务器、社区服务器、Faceit 等平台均无法使用，也没有任何绕过 VAC 的能力。
-- 用途：自娱自乐、录素材装高手、喊朋友来本地房然后开透视吓他一跳。
+- 官方服务器、社区服务器、Faceit、完美、5e 等平台均无法使用，也没有任何绕过 VAC 的能力。
+- 用途：开人机房自娱自乐、录素材装高手、或者喊朋友来本地房然后开透视掏出999999击杀的淬火ak暗金661贴5个titan的贴纸吓他一跳😂。
 - 有问题发issue反馈
 
 ## 构建
