@@ -25,6 +25,7 @@
 - **InventorySimulator**（本插件为此开发）
   - 启用皮肤和暗金武器后，`!st` 才能真正在刀面/枪身上看到效果
 - **[CS2-Bot-Improver](https://github.com/ed0ard/CS2-Bot-Improver)**（本插件为此开发）
+(以上所说的两个插件安装好之后。直接粘贴并替换进 CS2 的 `game/csgo/` 目录）
 
 ---
 
