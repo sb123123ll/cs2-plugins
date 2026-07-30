@@ -11,7 +11,7 @@ using CounterStrikeSharp.API.Modules.Utils;
 namespace XRayUnlocker;
 
 /// <summary>
-/// 本地透视 + 无敌插件 v1.3.1
+/// 本地透视 + 无敌插件 v1.3.2
 /// 
 /// 玩家透视（!x）：
 ///   创建不可见 prop_dynamic 幽灵发光实体跟随玩家模型，
@@ -26,7 +26,7 @@ namespace XRayUnlocker;
 public class XRayUnlockerPlugin : BasePlugin
 {
     public override string ModuleName => "XRayUnlocker";
-    public override string ModuleVersion => "1.3.1";
+    public override string ModuleVersion => "1.3.2";
     public override string ModuleAuthor => "CS2 Local Server";
     public override string ModuleDescription => "本地透视 !x + 无敌 !god + 暗金 !st";
 
@@ -38,6 +38,76 @@ public class XRayUnlockerPlugin : BasePlugin
     private readonly HashSet<int> _godPlayers = new();
     // pawn.Index → player.Slot 快速映射（OnPlayerTakeDamagePre 参数是 pawn 不是 controller）
     private readonly Dictionary<uint, int> _pawnToSlot = new();
+
+    // ==================== 防闪光 ====================
+    private readonly HashSet<int> _noFlashPlayers = new();
+
+    // ==================== 暗金计数器 ====================
+    // 双层存储：
+    //   _statTrakByEntity：按武器实体追踪（回合内区分不同实体，捡队友枪不感染）
+    //   _statTrakByType：   按武器型号兜底（跨回合/重买后恢复，同型号取最后一次设定值）
+    private readonly Dictionary<int, Dictionary<uint, int>> _statTrakByEntity = new();
+    private readonly Dictionary<int, Dictionary<string, int>> _statTrakByType = new();
+
+    /// <summary>
+    /// 获取指定武器实例的暗金计数值。
+    /// 优先按实体 Index 查找（回合内区分不同实体），
+    /// 找不到则按 DesignerName 兜底（跨回合/重买后恢复），
+    /// 兜底成功时自动迁移到实体索引。
+    /// </summary>
+    private int? GetStatTrakValue(int slot, CBasePlayerWeapon weapon)
+    {
+        uint entityIndex = weapon.Index;
+        int val;
+
+        // 优先按实体查找
+        if (_statTrakByEntity.TryGetValue(slot, out var entityDict)
+            && entityDict.TryGetValue(entityIndex, out val))
+            return val;
+
+        // 跨回合兜底：按型号查找并迁移
+        string designerName = weapon.DesignerName;
+        if (_statTrakByType.TryGetValue(slot, out var typeDict)
+            && typeDict.TryGetValue(designerName, out val))
+        {
+            if (!_statTrakByEntity.TryGetValue(slot, out entityDict))
+            {
+                entityDict = new Dictionary<uint, int>();
+                _statTrakByEntity[slot] = entityDict;
+            }
+            entityDict[entityIndex] = val;
+            return val;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// 设置指定武器实例的暗金计数值，同时更新实体层和型号层。
+    /// </summary>
+    private void SetStatTrakValue(int slot, CBasePlayerWeapon weapon, int value)
+    {
+        uint entityIndex = weapon.Index;
+        if (!_statTrakByEntity.TryGetValue(slot, out var entityDict))
+        {
+            entityDict = new Dictionary<uint, int>();
+            _statTrakByEntity[slot] = entityDict;
+        }
+        entityDict[entityIndex] = value;
+
+        string designerName = weapon.DesignerName;
+        if (!_statTrakByType.TryGetValue(slot, out var typeDict))
+        {
+            typeDict = new Dictionary<string, int>();
+            _statTrakByType[slot] = typeDict;
+        }
+        typeDict[designerName] = value;
+    }
+
+    // ==================== 暗金计数命令 ====================
+
+    private static readonly MemoryFunctionWithReturn<nint, string, float, int> _setAttributeValueByName =
+        new(GameData.GetSignature("CAttributeList::SetOrAddAttributeValueByName"));
 
     // ==================== 生命周期 ====================
 
@@ -60,7 +130,7 @@ public class XRayUnlockerPlugin : BasePlugin
         AddCommand("css_nf", "开关防闪光白屏", OnNoFlashCommand);
         AddCommand("nf", "控制台防闪光: nf 1 开启, nf 0 关闭", OnNoFlashConsoleCommand);
 
-        Console.WriteLine("[XRayUnlocker] v1.3.1 已加载 | !x 透视 | !god 无敌 | !st 暗金 | !nf 防闪 | 控制台: x/god/st/nf");
+        Console.WriteLine("[XRayUnlocker] v1.3.2 已加载 | !x 透视 | !god 无敌 | !st 暗金 | !nf 防闪 | 控制台: x/god/st/nf");
 
         if (hotReload)
         {
@@ -83,7 +153,8 @@ public class XRayUnlockerPlugin : BasePlugin
         _godPlayers.Clear();
         _noFlashPlayers.Clear();
         _pawnToSlot.Clear();
-        _statTrakCustomValues.Clear();
+        _statTrakByEntity.Clear();
+        _statTrakByType.Clear();
         Console.WriteLine("[XRayUnlocker] 已卸载");
     }
 
@@ -174,9 +245,6 @@ public class XRayUnlockerPlugin : BasePlugin
     }
 
     // ==================== 防闪光 ====================
-    private readonly HashSet<int> _noFlashPlayers = new();
-
-    // ==================== 防闪光 ====================
 
     private void OnNoFlashCommand(CCSPlayerController? player, CommandInfo info)
     {
@@ -219,11 +287,6 @@ public class XRayUnlockerPlugin : BasePlugin
     }
 
     // ==================== 暗金计数器 ====================
-    // player.Slot → (武器DesignerName → 自定义计数值)，per-weapon存储防止不同武器间计数串扰
-    private readonly Dictionary<int, Dictionary<string, int>> _statTrakCustomValues = new();
-
-    private static readonly MemoryFunctionWithReturn<nint, string, float, int> _setAttributeValueByName =
-        new(GameData.GetSignature("CAttributeList::SetOrAddAttributeValueByName"));
 
     private void OnStatTrakCommand(CCSPlayerController? player, CommandInfo info)
     {
@@ -272,15 +335,7 @@ public class XRayUnlockerPlugin : BasePlugin
             return;
         }
 
-        // 按武器类型存储，避免不同武器间串扰
-        var weaponName = weapon.DesignerName;
-        if (!_statTrakCustomValues.TryGetValue(player.Slot, out var weaponDict))
-        {
-            weaponDict = new Dictionary<string, int>();
-            _statTrakCustomValues[player.Slot] = weaponDict;
-        }
-        weaponDict[weaponName] = value;
-
+        SetStatTrakValue(player.Slot, weapon, value);
         ApplyStatTrakValue(weapon, value);
         player.PrintToChat($" [StatTrak] 暗金计数已修改为: {value} (击杀会在设定值上递增)");
     }
@@ -330,20 +385,19 @@ public class XRayUnlockerPlugin : BasePlugin
         if (@event.Userid != null && attacker.Slot == @event.Userid.Slot)
             return HookResult.Continue;
 
-        if (!_statTrakCustomValues.TryGetValue(attacker.Slot, out var weaponDict))
-            return HookResult.Continue;
+        int slot = attacker.Slot;
 
         // 延迟一帧确保 InvSim 已写入完成，再获取击杀武器并递增
         AddTimer(0.0f, () =>
         {
             var weapon = attacker.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value;
             if (weapon is not { IsValid: true }) return;
-            var weaponName = weapon.DesignerName;
-            if (!weaponDict.TryGetValue(weaponName, out int currentValue))
-                return;
 
-            int newValue = currentValue + 1;
-            weaponDict[weaponName] = newValue;
+            int? currentValue = GetStatTrakValue(slot, weapon);
+            if (!currentValue.HasValue) return;
+
+            int newValue = currentValue.Value + 1;
+            SetStatTrakValue(slot, weapon, newValue);
             ApplyStatTrakValue(weapon, newValue);
         });
 
@@ -356,26 +410,29 @@ public class XRayUnlockerPlugin : BasePlugin
     {
         var player = @event.Userid;
         if (player == null || !player.IsValid) return HookResult.Continue;
+        int slot = player.Slot;
         AddTimer(0.15f, () =>
         {
             CreatePlayerGlow(player);
             RegisterPawnMapping(player);
-            if (_godPlayers.Contains(player.Slot))
+            if (_godPlayers.Contains(slot))
                 SetupGodMode(player);
         });
         return HookResult.Continue;
     }
 
+    /// <summary>
+    /// 玩家断开时仅清理瞬态数据（glow 实体、pawn 映射）。
+    /// 不清理功能开关状态（_xrayUsers/_godPlayers/_noFlashPlayers/_statTrakCustomValues），
+    /// 因为换局时引擎可能重建玩家实体，触发虚假 disconnect。
+    /// 玩家主动退出时这些状态会随 Unload 或服务器关闭自然清理。
+    /// </summary>
     private HookResult OnPlayerDisconnect(EventPlayerDisconnect @event, GameEventInfo info)
     {
         var player = @event.Userid;
         if (player == null) return HookResult.Continue;
         RemovePlayerGlow(player);
         UnregisterPawnMapping(player);
-        _xrayUsers.Remove(player.Slot);
-        _godPlayers.Remove(player.Slot);
-        _noFlashPlayers.Remove(player.Slot);
-        _statTrakCustomValues.Remove(player.Slot);
         return HookResult.Continue;
     }
 
@@ -432,17 +489,6 @@ public class XRayUnlockerPlugin : BasePlugin
 
     // ==================== 无敌核心：引擎层伤害拦截 ====================
 
-    /// <summary>
-    /// 在引擎计算伤害之前拦截，直接将伤害量归零。
-    /// 与 EventPlayerHurt(Pre) 不同：Pre 事件钩子只能修改广播数据，
-    /// 致命伤害早已被引擎先行结算 → 玩家直接死亡。
-    /// 
-    /// OnPlayerTakeDamagePre 在伤害计算的更上游，伤害归零后：
-    ///  - HP 不下降（致命伤害也不会死）
-    ///  - 引擎不追加受击抖动（m_aimPunchAngle 基于伤害量）
-    ///  - 引擎不减速（m_flVelocityModifier 惩罚基于伤害量）
-    ///  - 子弹命中效果（血花、音效）由独立路径触发，不受影响
-    /// </summary>
     private HookResult OnPlayerTakeDamagePre(CCSPlayerPawn pawn, CTakeDamageInfo info)
     {
         if (pawn == null || !pawn.IsValid) return HookResult.Continue;
@@ -462,13 +508,13 @@ public class XRayUnlockerPlugin : BasePlugin
     private int _tickCounter;
 
     /// <summary>
-    /// 每帧：无敌 HP/Armor 兜底 + XRay 缺失 glow 修复 + 自定义 StatTrak 值防覆盖。
+    /// 每帧：无敌 HP/Armor 兜底 + NoFlash 归零 + 64帧周期 XRay glow 修复 / StatTrak 防覆盖。
     /// </summary>
     private void OnTick()
     {
         bool hasGod = _godPlayers.Count > 0;
         bool hasXray = _xrayUsers.Count > 0;
-        bool hasStatTrak = _statTrakCustomValues.Count > 0;
+        bool hasStatTrak = _statTrakByType.Count > 0;
         bool hasNoFlash = _noFlashPlayers.Count > 0;
         if (!hasGod && !hasXray && !hasStatTrak && !hasNoFlash) return;
 
@@ -510,15 +556,14 @@ public class XRayUnlockerPlugin : BasePlugin
                     }
                 }
 
-                if (hasStatTrak && _statTrakCustomValues.TryGetValue(slot, out var weaponDict))
+                if (hasStatTrak)
                 {
                     var weapon = player.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value;
                     if (weapon is { IsValid: true } && WeaponHasStatTrak(weapon))
                     {
-                        var weaponName = weapon.DesignerName;
-                        // 仅对已设定过 st 的武器类型做兜底，防止跨武器感染
-                        if (weaponDict.TryGetValue(weaponName, out int expected) && weapon.FallbackStatTrak != expected)
-                            ApplyStatTrakValue(weapon, expected);
+                        int? expected = GetStatTrakValue(slot, weapon);
+                        if (expected.HasValue && weapon.FallbackStatTrak != expected.Value)
+                            ApplyStatTrakValue(weapon, expected.Value);
                     }
                 }
             }
@@ -544,7 +589,7 @@ public class XRayUnlockerPlugin : BasePlugin
         if (pawn == null || !pawn.IsValid) return;
 
         // 清理同一玩家的旧 pawn 映射（换局时 pawn 重置，旧 Index 不再有效）
-        var slot = player.Slot;
+        int slot = player.Slot;
         var staleKeys = _pawnToSlot.Where(kv => kv.Value == slot && kv.Key != pawn.Index)
                                    .Select(kv => kv.Key).ToList();
         foreach (var key in staleKeys)
@@ -608,8 +653,9 @@ public class XRayUnlockerPlugin : BasePlugin
         catch { return; }
         if (string.IsNullOrEmpty(modelName)) return;
 
+        int slot = player.Slot;
         // 仅在确认能成功创建新实体后才清理旧实体，避免清空后无替代
-        if (_playerGlows.ContainsKey(player.Slot))
+        if (_playerGlows.ContainsKey(slot))
             RemovePlayerGlow(player);
 
         Color teamColor = player.Team switch
@@ -644,7 +690,7 @@ public class XRayUnlockerPlugin : BasePlugin
         relay.AcceptInput("FollowEntity", pawn, relay, "!activator");
         glow.AcceptInput("FollowEntity", relay, glow, "!activator");
 
-        _playerGlows[player.Slot] = (relay, glow);
+        _playerGlows[slot] = (relay, glow);
     }
 
     private void RemovePlayerGlow(CCSPlayerController player)
