@@ -22,9 +22,9 @@
 - **CounterStrikeSharp**（MinimumApiVersion 80+）
   - 下载：https://github.com/roflmuffin/CounterStrikeSharp/releases
   - 安装到 CS2 的 `game/csgo/` 目录
-- **InventorySimulator**（强烈推荐，暗金功能刚需）
+- **InventorySimulator**（本插件为此开发）
   - 启用皮肤和暗金武器后，`!st` 才能真正在刀面/枪身上看到效果
-- **[CS2-Bot-Improver](https://github.com/ed0ard/CS2-Bot-Improver)**（强烈推荐，让 BOT 更像真人）
+- **[CS2-Bot-Improver](https://github.com/ed0ard/CS2-Bot-Improver)**（本插件为此开发）
 
 ---
 
@@ -68,6 +68,7 @@ game/csgo/addons/counterstrikesharp/plugins/
 - **不是外挂，不是作弊器。** 所有功能依赖 CounterStrikeSharp 服务端插件框架，仅本地自建房有效。
 - 官方服务器、社区服务器、Faceit 等平台均无法使用，也没有任何绕过 VAC 的能力。
 - 用途：自娱自乐、录素材装高手、喊朋友来本地房然后开透视吓他一跳。
+- 有问题发issue反馈
 
 ## 构建
 
