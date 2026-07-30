@@ -19,8 +19,7 @@
 
 ## 环境要求
 
-- **CounterStrikeSharp**（MinimumApiVersion 80+）
-  - 下载：https://github.com/roflmuffin/CounterStrikeSharp/releases
+- **[CounterStrikeSharp](https://github.com/roflmuffin/CounterStrikeSharp/releases)**（MinimumApiVersion 80+）
   - 安装到 CS2 的 `game/csgo/` 目录
 - **[InventorySimulator](https://github.com/ianlucas/cs2-inventory-simulator)**（本插件为此开发）
   - 启用皮肤和暗金武器后，`!st` 才能真正在刀面/枪身上看到效果
