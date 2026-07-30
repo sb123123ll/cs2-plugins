@@ -75,5 +75,6 @@ game/csgo/addons/counterstrikesharp/plugins/
 ```bash
 dotnet build -c Release
 ```
+当然你去Release下构建好的就行，安装上面也有写👍
 
 `.csproj` 中 CounterStrikeSharp API 的 `HintPath` 按需修改。
