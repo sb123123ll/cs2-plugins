@@ -46,10 +46,12 @@ public class XRayUnlockerPlugin : BasePlugin
     // ==================== 防闪光 ====================
     private readonly HashSet<int> _noFlashPlayers = new();
 
-    // ==================== 暗金计数器（v1.4.0 简化版：最高权重系统）====================
-    // 单层存储：slot → DesignerName → 计数值
-    // OnTick 每帧强制写回，InvSim/原版暗金无法干涉
-    private readonly Dictionary<int, Dictionary<string, int>> _statTrakValues = new();
+    // ==================== 暗金计数器（v1.4.0 最高权重 + 实体防感染）====================
+    // slot → DesignerName → (EntityIndex, Value)
+    // EntityIndex 绑定"自己的枪"实体，击杀时仅匹配实体才递增，捡来的枪杀了不计
+    // 每回合开始 EntityIndex 重置为 0，OnTick 首次见到该型号时自动绑定
+    // OnTick 每帧强制写回值（显示），InvSim/原版暗金无法干涉
+    private readonly Dictionary<int, Dictionary<string, (uint EntityIndex, int Value)>> _statTrakValues = new();
 
     // ==================== 暗金计数命令 ====================
 
@@ -283,16 +285,16 @@ public class XRayUnlockerPlugin : BasePlugin
 
         int slot = player.Slot;
         string designerName = weapon.DesignerName;
+        uint entityIndex = weapon.Index;
 
-        // 写入内存存储，OnTick 每帧会强制覆盖确保最高权重
+        // 写入存储，绑定当前武器实体（用户的"自己的枪"）
         if (!_statTrakValues.TryGetValue(slot, out var typeDict))
         {
-            typeDict = new Dictionary<string, int>();
+            typeDict = new Dictionary<string, (uint, int)>();
             _statTrakValues[slot] = typeDict;
         }
-        typeDict[designerName] = value;
+        typeDict[designerName] = (entityIndex, value);
 
-        // 立即写入武器，避免等下一帧
         ApplyStatTrakValue(weapon, value);
         player.PrintToChat($" [StatTrak] 暗金计数已修改为: {value} (击杀会在设定值上递增)");
     }
@@ -331,34 +333,34 @@ public class XRayUnlockerPlugin : BasePlugin
     }
 
     /// <summary>
-    /// PostHook on EventPlayerDeath：从内存中递增该武器型号的暗金值。
-    /// OnTick 每帧强制覆盖确保 InvSim/原版无法干涉我们的值。
+    /// PostHook：从事件获取击杀武器名，检查实体是否为自己绑定的枪。
+    /// 捡来的枪杀了人不递增，只有"自己的枪"才递增。
     /// </summary>
     private HookResult OnPlayerDeathPost(EventPlayerDeath @event, GameEventInfo info)
     {
         var attacker = @event.Attacker;
         if (attacker == null || !attacker.IsValid) return HookResult.Continue;
-        // 攻击者和受害者不能是同一人（自杀、摔死不递增）
         if (@event.Userid != null && attacker.Slot == @event.Userid.Slot)
             return HookResult.Continue;
 
         int slot = attacker.Slot;
 
-        // 延迟一帧确保引擎/InvSim 写入完成，再用我们的值覆盖
-        AddTimer(0.0f, () =>
-        {
-            var weapon = attacker.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value;
-            if (weapon is not { IsValid: true }) return;
+        string evWeapon = @event.Weapon;
+        if (string.IsNullOrEmpty(evWeapon)) return HookResult.Continue;
+        string designerName = evWeapon.StartsWith("weapon_") ? evWeapon : "weapon_" + evWeapon;
 
-            string designerName = weapon.DesignerName;
-            if (!_statTrakValues.TryGetValue(slot, out var typeDict)
-                || !typeDict.TryGetValue(designerName, out int currentValue))
-                return;
+        if (!_statTrakValues.TryGetValue(slot, out var typeDict)
+            || !typeDict.TryGetValue(designerName, out var entry))
+            return HookResult.Continue;
 
-            int newValue = currentValue + 1;
-            typeDict[designerName] = newValue;
-            ApplyStatTrakValue(weapon, newValue);
-        });
+        // 检查当前手持武器实体是否匹配绑定的实体（非自己的枪不递增）
+        var weapon = attacker.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value;
+        if (weapon is not { IsValid: true } || weapon.Index != entry.EntityIndex)
+            return HookResult.Continue;
+
+        int newValue = entry.Value + 1;
+        typeDict[designerName] = (entry.EntityIndex, newValue);
+        ApplyStatTrakValue(weapon, newValue);
 
         return HookResult.Continue;
     }
@@ -382,7 +384,7 @@ public class XRayUnlockerPlugin : BasePlugin
 
     /// <summary>
     /// 玩家断开时仅清理瞬态数据（glow 实体、pawn 映射）。
-    /// 不清理功能开关状态（_xrayUsers/_godPlayers/_noFlashPlayers/_statTrakCustomValues），
+    /// 不清理功能开关状态（_xrayUsers/_godPlayers/_noFlashPlayers/_statTrakValues），
     /// 因为换局时引擎可能重建玩家实体，触发虚假 disconnect。
     /// 玩家主动退出时这些状态会随 Unload 或服务器关闭自然清理。
     /// </summary>
@@ -397,6 +399,17 @@ public class XRayUnlockerPlugin : BasePlugin
 
     private HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
     {
+        // 新回合开始，重置所有暗金实体绑定（玩家会买新枪，旧 EntityIndex 失效）
+        foreach (var typeDict in _statTrakValues.Values)
+        {
+            var keys = typeDict.Keys.ToList();
+            foreach (var key in keys)
+            {
+                var entry = typeDict[key];
+                typeDict[key] = (0, entry.Value); // 保留值，清空实体绑定
+            }
+        }
+
         // 多级重试兜底：pawn、CBodyComponent、SceneNode 都可能在换局后延迟就绪
         AddTimer(0.2f, () => RebuildAllPlayerStates());
         AddTimer(0.5f, () => RebuildAllPlayerStates());
@@ -503,17 +516,19 @@ public class XRayUnlockerPlugin : BasePlugin
                     pawn.FlashDuration = 0f;
             }
 
-            // 最高权重暗金覆盖：每帧强制写回，InvSim/原版无法干涉
+            // 最高权重暗金覆盖：每帧强制写回值（显示），InvSim/原版无法干涉
+            // 首次见到该型号（EntityIndex==0）时自动绑定实体为"自己的枪"
             if (hasStatTrak && _statTrakValues.TryGetValue(slot, out var typeDict))
             {
                 var weapon = player.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value;
                 if (weapon is { IsValid: true } && WeaponHasStatTrak(weapon))
                 {
                     string designerName = weapon.DesignerName;
-                    if (typeDict.TryGetValue(designerName, out int expected)
-                        && weapon.FallbackStatTrak != expected)
+                    if (typeDict.TryGetValue(designerName, out var entry))
                     {
-                        ApplyStatTrakValue(weapon, expected);
+                        if (entry.EntityIndex == 0)
+                            typeDict[designerName] = (weapon.Index, entry.Value);
+                        ApplyStatTrakValue(weapon, entry.Value);
                     }
                 }
             }
