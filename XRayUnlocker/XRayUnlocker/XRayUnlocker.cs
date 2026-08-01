@@ -49,9 +49,12 @@ public class XRayUnlockerPlugin : BasePlugin
     // ==================== 暗金计数器（v1.4.0 最高权重 + 实体防感染）====================
     // slot → DesignerName → (EntityIndex, Value)
     // EntityIndex 绑定"自己的枪"实体，击杀时仅匹配实体才递增，捡来的枪杀了不计
-    // 每回合开始 EntityIndex 重置为 0，OnTick 首次见到该型号时自动绑定
+    // 每回合开始 EntityIndex 重置为 0，通过购买事件 + 背包唯一性双重验证自动绑定
     // OnTick 每帧强制写回值（显示），InvSim/原版暗金无法干涉
     private readonly Dictionary<int, Dictionary<string, (uint EntityIndex, int Value)>> _statTrakValues = new();
+    // 追踪玩家本回合购买的武器（slot → designerName 集合）
+    // 用于新回合认领：买过的枪一定属于自己，跳过所有歧义检查
+    private readonly Dictionary<int, HashSet<string>> _purchasedThisRound = new();
 
     // ==================== 暗金计数命令 ====================
 
@@ -65,10 +68,12 @@ public class XRayUnlockerPlugin : BasePlugin
         RegisterListener<Listeners.OnTick>(OnTick);
         RegisterListener<Listeners.CheckTransmit>(OnCheckTransmit);
         RegisterListener<Listeners.OnPlayerTakeDamagePre>(OnPlayerTakeDamagePre);
+        RegisterListener<Listeners.OnEntityCreated>(OnWeaponEntityCreated);
         RegisterEventHandler<EventPlayerSpawn>(OnPlayerSpawn);
         RegisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
         RegisterEventHandler<EventRoundStart>(OnRoundStart);
         RegisterEventHandler<EventPlayerDeath>(OnPlayerDeathPost, HookMode.Post);
+        RegisterEventHandler<EventItemPurchase>(OnItemPurchase);
 
         AddCommand("css_x", "开关X光透视（敌我全体可见）", OnXRayCommand);
         AddCommand("css_god", "开关无敌模式（不掉血不抖动不减速）", OnGodCommand);
@@ -103,6 +108,7 @@ public class XRayUnlockerPlugin : BasePlugin
         _noFlashPlayers.Clear();
         _pawnToSlot.Clear();
         _statTrakValues.Clear();
+        _purchasedThisRound.Clear();
         Console.WriteLine("[XRayUnlocker] 已卸载");
     }
 
@@ -295,6 +301,14 @@ public class XRayUnlockerPlugin : BasePlugin
         }
         typeDict[designerName] = (entityIndex, value);
 
+        // !st 命令即认领，标记为本回合购买（最高优先级）
+        if (!_purchasedThisRound.TryGetValue(slot, out var purchasedSet))
+        {
+            purchasedSet = new HashSet<string>();
+            _purchasedThisRound[slot] = purchasedSet;
+        }
+        purchasedSet.Add(designerName);
+
         ApplyStatTrakValue(weapon, value);
         player.PrintToChat($" [StatTrak] 暗金计数已修改为: {value} (击杀会在设定值上递增)");
     }
@@ -333,6 +347,100 @@ public class XRayUnlockerPlugin : BasePlugin
     }
 
     /// <summary>
+    /// 检查玩家背包中是否仍持有指定实体索引的武器。
+    /// 用于判断旧绑定实体是否已被销毁/丢弃。
+    /// </summary>
+    private static bool PlayerHasWeaponEntity(CCSPlayerController player, uint entityIndex)
+    {
+        var weapons = player.PlayerPawn?.Value?.WeaponServices?.MyWeapons;
+        if (weapons == null) return false;
+        foreach (var w in weapons)
+        {
+            if (w?.Value?.Index == entityIndex)
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 购买事件：记录玩家本回合购买的武器型号。
+    /// 购买 = 一定属于自己，后续绑定跳过所有歧义检查。
+    /// </summary>
+    private HookResult OnItemPurchase(EventItemPurchase @event, GameEventInfo info)
+    {
+        var player = @event.Userid;
+        if (player == null || !player.IsValid) return HookResult.Continue;
+
+        string rawWeapon = @event.Weapon;
+        if (string.IsNullOrEmpty(rawWeapon)) return HookResult.Continue;
+
+        int slot = player.Slot;
+        string designerName = rawWeapon.StartsWith("weapon_") ? rawWeapon : "weapon_" + rawWeapon;
+
+        if (!_purchasedThisRound.TryGetValue(slot, out var set))
+        {
+            set = new HashSet<string>();
+            _purchasedThisRound[slot] = set;
+        }
+        set.Add(designerName);
+
+        return HookResult.Continue;
+    }
+
+    /// <summary>
+    /// 武器实体创建事件：捕获 buy / give 等所有途径获取的武器
+    /// 武器实体创建时 OwnerEntity 已设置，直接记录为"属于自己"
+    /// </summary>
+    private void OnWeaponEntityCreated(CEntityInstance entity)
+    {
+        if (entity is not CBasePlayerWeapon weapon || !weapon.IsValid) return;
+        if (!WeaponHasStatTrak(weapon)) return;
+
+        var owner = weapon.OwnerEntity?.Value;
+        if (owner is not CCSPlayerController player || !player.IsValid) return;
+
+        int slot = player.Slot;
+        string designerName = weapon.DesignerName;
+
+        if (!_purchasedThisRound.TryGetValue(slot, out var set))
+        {
+            set = new HashSet<string>();
+            _purchasedThisRound[slot] = set;
+        }
+        set.Add(designerName);
+    }
+
+    /// <summary>
+    /// 判断是否应该认领当前武器为自己的枪。
+    /// 优先级：1) 本回合购买过 / !st 设置过 → 一定属于自己
+    ///         2) EntityIndex 匹配 → 已绑定，无需认领
+    ///         3) EntityIndex==0 且武器已带有我们的暗金值 → 从上回合保留
+    ///         其余情况 → 不认领（歧义，可能是别人的枪）
+    /// </summary>
+    private bool ShouldClaimWeapon(CCSPlayerController player, CBasePlayerWeapon weapon, uint boundEntityIndex, string designerName, int storedValue)
+    {
+        int slot = player.Slot;
+
+        // 本回合购买过 / !st 设置过 → 一定属于自己
+        if (_purchasedThisRound.TryGetValue(slot, out var purchasedSet)
+            && purchasedSet.Contains(designerName))
+        {
+            purchasedSet.Remove(designerName); // 消费掉，避免重复认领
+            return true;
+        }
+
+        // 已绑定且匹配
+        if (boundEntityIndex != 0 && boundEntityIndex == weapon.Index)
+            return true;
+
+        // 未绑定 + 武器已带有我们的暗金指纹 → 从上回合保留的自己的枪
+        if (boundEntityIndex == 0 && weapon.FallbackStatTrak == storedValue)
+            return true;
+
+        return false;
+    }
+
+    /// <summary>
     /// PostHook：从事件获取击杀武器名，检查实体是否为自己绑定的枪。
     /// 捡来的枪杀了人不递增，只有"自己的枪"才递增。
     /// </summary>
@@ -353,13 +461,16 @@ public class XRayUnlockerPlugin : BasePlugin
             || !typeDict.TryGetValue(designerName, out var entry))
             return HookResult.Continue;
 
-        // 检查当前手持武器实体是否匹配绑定的实体（非自己的枪不递增）
         var weapon = attacker.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value;
-        if (weapon is not { IsValid: true } || weapon.Index != entry.EntityIndex)
+        if (weapon is not { IsValid: true })
+            return HookResult.Continue;
+
+        // 多条件综合判断：这枪属于自己吗？
+        if (!ShouldClaimWeapon(attacker, weapon, entry.EntityIndex, designerName, entry.Value))
             return HookResult.Continue;
 
         int newValue = entry.Value + 1;
-        typeDict[designerName] = (entry.EntityIndex, newValue);
+        typeDict[designerName] = (weapon.Index, newValue);
         ApplyStatTrakValue(weapon, newValue);
 
         return HookResult.Continue;
@@ -409,6 +520,9 @@ public class XRayUnlockerPlugin : BasePlugin
                 typeDict[key] = (0, entry.Value); // 保留值，清空实体绑定
             }
         }
+
+        // 清空本回合购买记录
+        _purchasedThisRound.Clear();
 
         // 多级重试兜底：pawn、CBodyComponent、SceneNode 都可能在换局后延迟就绪
         AddTimer(0.2f, () => RebuildAllPlayerStates());
@@ -516,8 +630,8 @@ public class XRayUnlockerPlugin : BasePlugin
                     pawn.FlashDuration = 0f;
             }
 
-            // 最高权重暗金覆盖：每帧强制写回值（显示），InvSim/原版无法干涉
-            // 首次见到该型号（EntityIndex==0）时自动绑定实体为"自己的枪"
+            // 暗金覆盖与绑定：
+            // 只对自己绑定的武器写值，不污染别人的枪
             if (hasStatTrak && _statTrakValues.TryGetValue(slot, out var typeDict))
             {
                 var weapon = player.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value;
@@ -526,9 +640,15 @@ public class XRayUnlockerPlugin : BasePlugin
                     string designerName = weapon.DesignerName;
                     if (typeDict.TryGetValue(designerName, out var entry))
                     {
-                        if (entry.EntityIndex == 0)
-                            typeDict[designerName] = (weapon.Index, entry.Value);
-                        ApplyStatTrakValue(weapon, entry.Value);
+                        // 尝试认领（购买记录 / 已绑定 / 暗金指纹匹配）
+                        if (ShouldClaimWeapon(player, weapon, entry.EntityIndex, designerName, entry.Value))
+                        {
+                            // 认领成功 → 绑定 + 写值
+                            if (entry.EntityIndex != weapon.Index)
+                                typeDict[designerName] = (weapon.Index, entry.Value);
+                            ApplyStatTrakValue(weapon, entry.Value);
+                        }
+                        // 未认领 → 不写值（不污染别人的枪）
                     }
                 }
             }
