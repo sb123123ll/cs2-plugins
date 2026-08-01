@@ -11,9 +11,7 @@
 ---
 
 ## 重要：请搭配 InventorySimulator 和 CS2-Bot-Improver 使用
-如果你没下，那就去https://github.com/ed0ard/CS2-Bot-Improver 和 https://github.com/ianlucas/cs2-inventory-simulator
-
-**换个说法，本插件就是为了这个插件而开发的。解决了InventorySimulator不能自定义暗金计数器击杀数的弊端（仅限当局，新开可以重新输入指令），并且加入了本地上的无敌透视和防闪光白屏功能，防止你被增强人机打红温。或者你也可以用它来录个视频装高手、整蛊朋友😂**
+**换个说法，本插件就是为了这个插件而开发的。修复了InventorySimulator不能自定义暗金计数器击杀数的弊端（仅限当局，新开可以重新输入指令），并且加入了本地上的无敌透视和防闪光白屏功能，防止你被增强人机打红温。或者你也可以用它来录个视频装高手、整蛊朋友😂**
 ---
 
 ## 环境要求
