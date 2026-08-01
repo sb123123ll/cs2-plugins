@@ -1,9 +1,12 @@
 using System.Drawing;
+using System.Text.Json;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes;
 using CounterStrikeSharp.API.Core.Attributes.Registration;
 using CounterStrikeSharp.API.Modules.Commands;
+using CounterStrikeSharp.API.Modules.Cvars;
+using CounterStrikeSharp.API.Modules.Extensions;
 using CounterStrikeSharp.API.Modules.Memory;
 using CounterStrikeSharp.API.Modules.Memory.DynamicFunctions;
 using CounterStrikeSharp.API.Modules.Utils;
@@ -30,9 +33,9 @@ namespace XRayUnlocker;
 public class XRayUnlockerPlugin : BasePlugin
 {
     public override string ModuleName => "XRayUnlocker";
-    public override string ModuleVersion => "1.4.0";
+    public override string ModuleVersion => "1.5.0";
     public override string ModuleAuthor => "CS2 Local Server";
-    public override string ModuleDescription => "本地透视 !x + 无敌 !god + 暗金 !st";
+    public override string ModuleDescription => "透视 !x + 无敌 !god + 暗金 !st + 防闪 !nf + 蹲起 !sc + BOT数量解锁 + 暗金JSON持久化 !stattrak";
 
     // ==================== 玩家透视 ====================
     private readonly Dictionary<int, (CDynamicProp relay, CDynamicProp glow)> _playerGlows = new();
@@ -46,6 +49,14 @@ public class XRayUnlockerPlugin : BasePlugin
     // ==================== 防闪光 ====================
     private readonly HashSet<int> _noFlashPlayers = new();
 
+    // ==================== 无限蹲起（无体力）====================
+    private readonly HashSet<int> _noStaminaPlayers = new();  // 开启的玩家
+    private bool _staminaCvarsSet;                             // 全局 cvar 是否已设
+
+    // ==================== BOT数量解锁 ====================
+    private const int MaxPerTeam = 32;
+    private readonly List<string> _createdSpawnGlobalnames = new();
+
     // ==================== 暗金计数器（v1.4.0 最高权重 + 实体防感染）====================
     // slot → DesignerName → (EntityIndex, Value)
     // EntityIndex 绑定"自己的枪"实体，击杀时仅匹配实体才递增，捡来的枪杀了不计
@@ -56,6 +67,10 @@ public class XRayUnlockerPlugin : BasePlugin
     // 用于新回合认领：买过的枪一定属于自己，跳过所有歧义检查
     private readonly Dictionary<int, HashSet<string>> _purchasedThisRound = new();
 
+    // StatTrak JSON 持久化（跨会话保留击杀记录）
+    private Dictionary<string, Dictionary<string, int>> _savedKillCounts = new();
+    private string _stattrakJsonPath = string.Empty;
+
     // ==================== 暗金计数命令 ====================
 
     private static readonly MemoryFunctionWithReturn<nint, string, float, int> _setAttributeValueByName =
@@ -65,6 +80,9 @@ public class XRayUnlockerPlugin : BasePlugin
 
     public override void Load(bool hotReload)
     {
+        _stattrakJsonPath = Path.Combine(ModuleDirectory, "stattrak_data.json");
+        LoadStatTrakData();
+
         RegisterListener<Listeners.OnTick>(OnTick);
         RegisterListener<Listeners.CheckTransmit>(OnCheckTransmit);
         RegisterListener<Listeners.OnPlayerTakeDamagePre>(OnPlayerTakeDamagePre);
@@ -75,6 +93,9 @@ public class XRayUnlockerPlugin : BasePlugin
         RegisterEventHandler<EventPlayerDeath>(OnPlayerDeathPost, HookMode.Post);
         RegisterEventHandler<EventItemPurchase>(OnItemPurchase);
 
+        RegisterListener<Listeners.OnMapStart>(OnMapStart);
+        AddCommandListener("bot_add", OnBotAddCommand, HookMode.Pre);
+
         AddCommand("css_x", "开关X光透视（敌我全体可见）", OnXRayCommand);
         AddCommand("css_god", "开关无敌模式（不掉血不抖动不减速）", OnGodCommand);
         AddCommand("x", "控制台透视开关: x 1 开启, x 0 关闭", OnXConsoleCommand);
@@ -83,8 +104,11 @@ public class XRayUnlockerPlugin : BasePlugin
         AddCommand("st", "控制台修改暗金计数器: st <数字>", OnStatTrakConsoleCommand);
         AddCommand("css_nf", "开关防闪光白屏", OnNoFlashCommand);
         AddCommand("nf", "控制台防闪光: nf 1 开启, nf 0 关闭", OnNoFlashConsoleCommand);
+        AddCommand("css_sc", "开关无限蹲起（无体力无冷却）", OnSpamCrouchCommand);
+        AddCommand("sc", "控制台无限蹲起: sc 1 开启, sc 0 关闭", OnSpamCrouchConsoleCommand);
+        AddCommand("css_stattrak", "暗金JSON管理: stattrakshow [武器名] 或 stattraks<数字>设置基准", OnStattrakJsonCommand);
 
-        Console.WriteLine("[XRayUnlocker] v1.4.0 已加载 | !x 透视 | !god 无敌 | !st 暗金 | !nf 防闪 | 控制台: x/god/st/nf");
+        Console.WriteLine("[XRayUnlocker] v1.5.0 已加载 | !x !god !st !nf !sc !stattrak | BOT数量解锁已启用");
 
         if (hotReload)
         {
@@ -97,6 +121,11 @@ public class XRayUnlockerPlugin : BasePlugin
                     RegisterPawnMapping(p);
                 }
             });
+            AddTimer(1.0f, () =>
+            {
+                EnsureSpawnPoints();
+                ApplyAllLimits();
+            });
         }
     }
 
@@ -106,9 +135,12 @@ public class XRayUnlockerPlugin : BasePlugin
         _xrayUsers.Clear();
         _godPlayers.Clear();
         _noFlashPlayers.Clear();
+        _noStaminaPlayers.Clear();
+        _purchasedThisRound.Clear();
         _pawnToSlot.Clear();
         _statTrakValues.Clear();
-        _purchasedThisRound.Clear();
+        RemoveCreatedSpawns();
+        SaveStatTrakData();
         Console.WriteLine("[XRayUnlocker] 已卸载");
     }
 
@@ -240,6 +272,85 @@ public class XRayUnlockerPlugin : BasePlugin
         }
     }
 
+    // ==================== 无限蹲起（!sc / sc）====================
+
+    private void OnSpamCrouchCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        int slot = player.Slot;
+
+        if (_noStaminaPlayers.Contains(slot))
+            DisableNoStamina(player);
+        else
+            EnableNoStamina(player);
+    }
+
+    private void OnSpamCrouchConsoleCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+
+        if (info.ArgCount < 2)
+        {
+            player.PrintToChat(" [SpamCrouch] 用法: sc 1 开启 / sc 0 关闭");
+            return;
+        }
+
+        if (int.TryParse(info.GetArg(1), out int val) && val == 0)
+            DisableNoStamina(player);
+        else
+            EnableNoStamina(player);
+    }
+
+    private void EnableNoStamina(CCSPlayerController player)
+    {
+        int slot = player.Slot;
+        if (_noStaminaPlayers.Contains(slot))
+        {
+            player.PrintToChat(" [SpamCrouch] 无限蹲起已经开启");
+            return;
+        }
+
+        _noStaminaPlayers.Add(slot);
+
+        // 全局 cvar 仅首次设置
+        if (!_staminaCvarsSet)
+        {
+            Server.ExecuteCommand("sv_stamina 0");
+            Server.ExecuteCommand("sv_staminajumpcost 0");
+            Server.ExecuteCommand("sv_staminalandcost 0");
+            Server.ExecuteCommand("sv_staminarecoveryrate 9999");
+            Server.ExecuteCommand("sv_staminamax 0");
+            Server.ExecuteCommand("sv_timebetweenducks 0");
+            Server.ExecuteCommand("sv_jump_spam_penalty_time 0");
+            _staminaCvarsSet = true;
+        }
+
+        player.PrintToChat(" [SpamCrouch] 无限蹲起已开启 - 无体力无冷却");
+    }
+
+    private void DisableNoStamina(CCSPlayerController player)
+    {
+        int slot = player.Slot;
+        if (!_noStaminaPlayers.Remove(slot))
+        {
+            player.PrintToChat(" [SpamCrouch] 无限蹲起已经关闭");
+            return;
+        }
+
+        // 所有玩家都关闭时才恢复 cvar
+        if (_noStaminaPlayers.Count == 0 && _staminaCvarsSet)
+        {
+            Server.ExecuteCommand("sv_stamina 1");
+            Server.ExecuteCommand("sv_staminajumpcost 0.08");
+            Server.ExecuteCommand("sv_staminalandcost 0.05");
+            Server.ExecuteCommand("sv_staminarecoveryrate 60");
+            Server.ExecuteCommand("sv_staminamax 80");
+            _staminaCvarsSet = false;
+        }
+
+        player.PrintToChat(" [SpamCrouch] 无限蹲起已关闭 - 体力已恢复");
+    }
+
     // ==================== 暗金计数器 ====================
 
     private void OnStatTrakCommand(CCSPlayerController? player, CommandInfo info)
@@ -328,22 +439,36 @@ public class XRayUnlockerPlugin : BasePlugin
     }
 
     /// <summary>
-    /// 将暗金计数值写入武器，同时覆盖原生 FallbackStatTrak 和 InvSim 的 kill eater 属性。
+    /// 将暗金计数值写入武器。双写 FallbackStatTrak + kill eater 属性，
+    /// 且延迟 0.0f 再写一次 FallbackStatTrak，确保在所有 Tick 处理完后最后写入。
     /// </summary>
     private void ApplyStatTrakValue(CBasePlayerWeapon weapon, int value)
     {
+        // 立即写入 FallbackStatTrak（显示）
         weapon.FallbackStatTrak = value;
         Utilities.SetStateChanged(weapon, "CCSWeaponBase", "m_nFallbackStatTrak");
 
+        // 立即写入 kill eater 动态属性（"真实击杀"源头）
         var dynAttrs = weapon.AttributeManager?.Item?.NetworkedDynamicAttributes;
         if (dynAttrs != null)
         {
             nint handle = ((NativeObject)(object)dynAttrs).Handle;
-            float floatValue = BitConverter.Int32BitsToSingle(value);
-            _setAttributeValueByName.Invoke(handle, "kill eater", floatValue);
-            _setAttributeValueByName.Invoke(handle, "kill eater score type", 0f);
-            Utilities.SetStateChanged(weapon, "CBasePlayerWeapon", "m_AttributeManager");
+            if (handle != nint.Zero)
+            {
+                float floatValue = BitConverter.Int32BitsToSingle(value);
+                _setAttributeValueByName.Invoke(handle, "kill eater", floatValue);
+                _setAttributeValueByName.Invoke(handle, "kill eater score type", 0f);
+            }
         }
+
+        // 0.0f 延迟再写一次 FallbackStatTrak —— 确保在所有 OnTick 之后执行，不被 InvSim 覆盖
+        var w = weapon;
+        AddTimer(0.0f, () =>
+        {
+            if (w is not { IsValid: true }) return;
+            w.FallbackStatTrak = value;
+            Utilities.SetStateChanged(w, "CCSWeaponBase", "m_nFallbackStatTrak");
+        });
     }
 
     /// <summary>
@@ -389,12 +514,11 @@ public class XRayUnlockerPlugin : BasePlugin
 
     /// <summary>
     /// 武器实体创建事件：捕获 buy / give 等所有途径获取的武器
-    /// 武器实体创建时 OwnerEntity 已设置，直接记录为"属于自己"
+    /// 只记录玩家有关心值（_statTrakValues 中有该型号）的武器，不依赖武器自身是否暗金
     /// </summary>
     private void OnWeaponEntityCreated(CEntityInstance entity)
     {
         if (entity is not CBasePlayerWeapon weapon || !weapon.IsValid) return;
-        if (!WeaponHasStatTrak(weapon)) return;
 
         var owner = weapon.OwnerEntity?.Value;
         if (owner is not CCSPlayerController player || !player.IsValid) return;
@@ -402,12 +526,24 @@ public class XRayUnlockerPlugin : BasePlugin
         int slot = player.Slot;
         string designerName = weapon.DesignerName;
 
+        // 只记录玩家有 ST 值的武器类型（不关心没设过的枪）
+        if (!_statTrakValues.TryGetValue(slot, out var typeDict)
+            || !typeDict.ContainsKey(designerName))
+            return;
+
         if (!_purchasedThisRound.TryGetValue(slot, out var set))
         {
             set = new HashSet<string>();
             _purchasedThisRound[slot] = set;
         }
         set.Add(designerName);
+
+        // 立即绑定并写值，不等 OnTick，防止切后台时 OnTick 迟迟不触发导致显示真实击杀值
+        var entry = typeDict[designerName];
+        typeDict[designerName] = (weapon.Index, entry.Value);
+        // 如果武器已经是暗金（InvSim 已套皮），立即写值覆盖真实击杀数
+        if (WeaponHasStatTrak(weapon))
+            ApplyStatTrakValue(weapon, entry.Value);
     }
 
     /// <summary>
@@ -473,6 +609,9 @@ public class XRayUnlockerPlugin : BasePlugin
         typeDict[designerName] = (weapon.Index, newValue);
         ApplyStatTrakValue(weapon, newValue);
 
+        // JSON 持久化记录
+        IncrementJsonKillCount(attacker, designerName);
+
         return HookResult.Continue;
     }
 
@@ -510,6 +649,8 @@ public class XRayUnlockerPlugin : BasePlugin
 
     private HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
     {
+        ApplyAllLimits();
+
         // 新回合开始，重置所有暗金实体绑定（玩家会买新枪，旧 EntityIndex 失效）
         foreach (var typeDict in _statTrakValues.Values)
         {
@@ -579,8 +720,21 @@ public class XRayUnlockerPlugin : BasePlugin
     {
         if (pawn == null || !pawn.IsValid) return HookResult.Continue;
 
-        if (!_pawnToSlot.TryGetValue(pawn.Index, out int slot))
+        // 优先通过 pawn → Controller 查找，绕过 _pawnToSlot 映射可能超时的问题（切后台时）
+        var controller = pawn.Controller?.Value;
+        int slot;
+
+        if (controller is CCSPlayerController player && player.IsValid)
+        {
+            slot = player.Slot;
+            // 修复映射（如果通过 Controller 找到了但映射里没有）
+            if (!_pawnToSlot.ContainsKey(pawn.Index))
+                _pawnToSlot[pawn.Index] = slot;
+        }
+        else if (!_pawnToSlot.TryGetValue(pawn.Index, out slot))
+        {
             return HookResult.Continue;
+        }
 
         if (!_godPlayers.Contains(slot)) return HookResult.Continue;
 
@@ -603,7 +757,8 @@ public class XRayUnlockerPlugin : BasePlugin
         bool hasXray = _xrayUsers.Count > 0;
         bool hasStatTrak = _statTrakValues.Count > 0;
         bool hasNoFlash = _noFlashPlayers.Count > 0;
-        if (!hasGod && !hasXray && !hasStatTrak && !hasNoFlash) return;
+        bool hasStamina = _noStaminaPlayers.Count > 0;
+        if (!hasGod && !hasXray && !hasStatTrak && !hasNoFlash && !hasStamina) return;
 
         _tickCounter++;
 
@@ -628,6 +783,17 @@ public class XRayUnlockerPlugin : BasePlugin
                 var pawn = player.PlayerPawn?.Value;
                 if (pawn is { IsValid: true })
                     pawn.FlashDuration = 0f;
+            }
+
+            // 无限蹲起：每帧重置 DuckSpeed，绕过引擎硬编码的蹲起速度递减
+            if (hasStamina && _noStaminaPlayers.Contains(slot))
+            {
+                var pawn = player.PlayerPawn?.Value;
+                if (pawn is { IsValid: true } && pawn.MovementServices != null)
+                {
+                    // m_flDuckSpeed 偏移 1040，引擎每蹲一次就减小，强制恢复满值
+                    Schema.SetSchemaValue<float>(pawn.MovementServices.Handle, "CCSPlayer_MovementServices", "m_flDuckSpeed", 6.0f);
+                }
             }
 
             // 暗金覆盖与绑定：
@@ -809,4 +975,226 @@ public class XRayUnlockerPlugin : BasePlugin
         }
         _playerGlows.Clear();
     }
+
+    // ==================== BOT数量解锁 ====================
+
+    private void OnMapStart(string mapName)
+    {
+        AddTimer(1.0f, () =>
+        {
+            EnsureSpawnPoints();
+            ApplyAllLimits();
+        });
+    }
+
+    private HookResult OnBotAddCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        ApplyAllLimits();
+        return HookResult.Continue;
+    }
+
+    private void EnsureSpawnPoints()
+    {
+        RemoveCreatedSpawns();
+
+        var tSpawns = Utilities.FindAllEntitiesByDesignerName<CBaseEntity>("info_player_terrorist").ToArray();
+        var ctSpawns = Utilities.FindAllEntitiesByDesignerName<CBaseEntity>("info_player_counterterrorist").ToArray();
+
+        int nativeT = tSpawns.Length;
+        int nativeCT = ctSpawns.Length;
+
+        int botQuota = 0;
+        try
+        {
+            var botQuotaCvar = ConVar.Find("bot_quota");
+            if (botQuotaCvar != null)
+                botQuota = botQuotaCvar.GetPrimitiveValue<int>();
+        }
+        catch { }
+
+        int neededPerTeam = Math.Max(Math.Min(botQuota / 2, MaxPerTeam), 0);
+        // 至少保持原生数量
+        neededPerTeam = Math.Max(neededPerTeam, nativeCT);
+        neededPerTeam = Math.Max(neededPerTeam, nativeT);
+
+        Console.WriteLine($"[BotNumber] 原生 T:{nativeT}, CT:{nativeCT} | bot_quota={botQuota} 每方上限{MaxPerTeam}");
+
+        if (neededPerTeam > nativeCT)
+        {
+            int created = CreateExtraSpawns("info_player_counterterrorist", ctSpawns, neededPerTeam - nativeCT, 3);
+            Console.WriteLine($"[BotNumber] CT出生点: +{created} → 共{nativeCT + created}");
+        }
+        if (neededPerTeam > nativeT)
+        {
+            int created = CreateExtraSpawns("info_player_terrorist", tSpawns, neededPerTeam - nativeT, 2);
+            Console.WriteLine($"[BotNumber] T出生点: +{created} → 共{nativeT + created}");
+        }
+    }
+
+    private int CreateExtraSpawns(string className, CBaseEntity[] templates, int needed, byte teamNum)
+    {
+        if (templates.Length == 0) return 0;
+
+        var random = new Random();
+        int created = 0;
+
+        for (int i = 0; i < needed; i++)
+        {
+            var template = templates[random.Next(templates.Length)];
+            if (template?.AbsOrigin == null) continue;
+
+            float offsetX = (float)((random.NextDouble() - 0.5f) * 80f);
+            float offsetY = (float)((random.NextDouble() - 0.5f) * 80f);
+
+            var newEntity = Utilities.CreateEntityByName<CBaseEntity>(className);
+            if (newEntity == null || !newEntity.IsValid) continue;
+
+            newEntity.AbsOrigin!.X = template.AbsOrigin.X + offsetX;
+            newEntity.AbsOrigin.Y = template.AbsOrigin.Y + offsetY;
+            newEntity.AbsOrigin.Z = template.AbsOrigin.Z;
+            if (template.AbsRotation != null)
+            {
+                newEntity.AbsRotation!.X = template.AbsRotation.X;
+                newEntity.AbsRotation.Y = template.AbsRotation.Y;
+                newEntity.AbsRotation.Z = template.AbsRotation.Z;
+            }
+            newEntity.TeamNum = teamNum;
+            string gname = $"botnum_{className}_{i}";
+            newEntity.Globalname = gname;
+            newEntity.DispatchSpawn();
+            _createdSpawnGlobalnames.Add(gname);
+            created++;
+        }
+
+        return created;
+    }
+
+    private void RemoveCreatedSpawns()
+    {
+        foreach (var gname in _createdSpawnGlobalnames)
+        {
+            var entities = Utilities.FindAllEntitiesByDesignerName<CBaseEntity>(
+                gname.Contains("terrorist") ? "info_player_terrorist" : "info_player_counterterrorist");
+            foreach (var entity in entities)
+            {
+                if (entity.Globalname == gname && entity.IsValid)
+                    entity.Remove();
+            }
+        }
+        _createdSpawnGlobalnames.Clear();
+    }
+
+    private void ApplyAllLimits()
+    {
+        foreach (var proxy in Utilities.FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules"))
+        {
+            if (proxy.GameRules == null) continue;
+            proxy.GameRules.NumSpawnableCT = MaxPerTeam;
+            proxy.GameRules.NumSpawnableTerrorist = MaxPerTeam;
+            proxy.GameRules.MaxNumCTs = MaxPerTeam;
+            proxy.GameRules.MaxNumTerrorists = MaxPerTeam;
+        }
+
+        Server.ExecuteCommand("mp_autoteambalance 0");
+        Server.ExecuteCommand("mp_limitteams 0");
+    }
+
+    // ==================== 暗金JSON持久化 ====================
+
+    private void LoadStatTrakData()
+    {
+        try
+        {
+            if (File.Exists(_stattrakJsonPath))
+            {
+                var json = File.ReadAllText(_stattrakJsonPath);
+                _savedKillCounts = JsonSerializer.Deserialize<Dictionary<string, Dictionary<string, int>>>(json) ?? new();
+            }
+        }
+        catch { }
+    }
+
+    private void SaveStatTrakData()
+    {
+        try
+        {
+            File.WriteAllText(_stattrakJsonPath,
+                JsonSerializer.Serialize(_savedKillCounts, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch { }
+    }
+
+    private void IncrementJsonKillCount(CCSPlayerController attacker, string designerName)
+    {
+        string steamId = attacker.SteamID.ToString();
+        if (!_savedKillCounts.ContainsKey(steamId))
+            _savedKillCounts[steamId] = new Dictionary<string, int>();
+
+        _savedKillCounts[steamId].TryGetValue(designerName, out int cur);
+        _savedKillCounts[steamId][designerName] = cur + 1;
+        SaveStatTrakData();
+    }
+
+    private void OnStattrakJsonCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        string steamId = player.SteamID.ToString();
+
+        // !stattrak show [武器名]
+        if (info.ArgCount >= 2 && info.ArgByIndex(1).ToLower() == "show")
+        {
+            if (info.ArgCount < 3)
+            {
+                var pw = player.PlayerPawn?.Value;
+                var w = pw?.WeaponServices?.ActiveWeapon?.Value;
+                if (w == null || !w.IsValid) { player.PrintToChat(" 无法获取当前武器"); return; }
+                string wn = w.DesignerName;
+                if (string.IsNullOrEmpty(wn)) return;
+
+                _savedKillCounts.TryGetValue(steamId, out var dict);
+                int cnt = 0;
+                dict?.TryGetValue(wn, out cnt);
+                player.PrintToChat($" {DisplayName(wn)} 累计击杀: {cnt}");
+                return;
+            }
+
+            string weaponArg = NormalizeWeaponName(info.ArgByIndex(2));
+            _savedKillCounts.TryGetValue(steamId, out var allWeapons);
+            int count = 0;
+            allWeapons?.TryGetValue(weaponArg, out count);
+            player.PrintToChat($" {DisplayName(weaponArg)} 累计击杀: {count}");
+            return;
+        }
+
+        // !stattrak <数字>
+        if (info.ArgCount < 2)
+        {
+            player.PrintToChat(" !stattrak show [武器名]  查看累计击杀");
+            player.PrintToChat(" !stattrak <数字>  设置当前武器计数基准");
+            return;
+        }
+
+        if (!int.TryParse(info.ArgByIndex(1), out int newValue) || newValue < 0)
+        {
+            player.PrintToChat(" 请输入有效数字（0或正整数）");
+            return;
+        }
+
+        var pawn = player.PlayerPawn?.Value;
+        var weapon = pawn?.WeaponServices?.ActiveWeapon?.Value;
+        if (weapon == null || !weapon.IsValid) { player.PrintToChat(" 无法获取当前武器"); return; }
+
+        string weaponName = weapon.DesignerName;
+        if (string.IsNullOrEmpty(weaponName)) return;
+
+        if (!_savedKillCounts.ContainsKey(steamId))
+            _savedKillCounts[steamId] = new Dictionary<string, int>();
+        _savedKillCounts[steamId][weaponName] = newValue;
+        SaveStatTrakData();
+
+        player.PrintToChat($" {DisplayName(weaponName)} 计数基准已设为 {newValue}");
+    }
+
+    private static string DisplayName(string n) => (n.StartsWith("weapon_") ? n[7..] : n).ToUpperInvariant();
+    private static string NormalizeWeaponName(string raw) => raw.ToLowerInvariant().StartsWith("weapon_") ? raw.ToLowerInvariant() : "weapon_" + raw.ToLowerInvariant();
 }
