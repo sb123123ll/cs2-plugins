@@ -35,7 +35,7 @@ public class XRayUnlockerPlugin : BasePlugin
     public override string ModuleName => "XRayUnlocker";
     public override string ModuleVersion => "1.5.0";
     public override string ModuleAuthor => "CS2 Local Server";
-    public override string ModuleDescription => "透视 !x + 无敌 !god + 暗金 !st + 防闪 !nf + 蹲起 !sc + BOT数量解锁 + 暗金JSON持久化 !stattrak";
+    public override string ModuleDescription => "透视 !x + 无敌 !god + 暗金 !st + 防闪 !nf + 蹲起 !sc + 全图可穿 !wp + 穿墙无衰减 !wd + BOT数量解锁 + 暗金JSON持久化 !stattrak";
 
     // ==================== 玩家透视 ====================
     private readonly Dictionary<int, (CDynamicProp relay, CDynamicProp glow)> _playerGlows = new();
@@ -52,6 +52,17 @@ public class XRayUnlockerPlugin : BasePlugin
     // ==================== 无限蹲起（无体力）====================
     private readonly HashSet<int> _noStaminaPlayers = new();  // 开启的玩家
     private bool _staminaCvarsSet;                             // 全局 cvar 是否已设
+
+    // ==================== 穿墙功能：全图可穿 ====================
+    private readonly HashSet<int> _fullPenPlayers = new();           // 全图可穿玩家
+
+    // ==================== 穿墙功能：穿墙无伤害衰减 ====================
+    private readonly HashSet<int> _noWallDmgReductionPlayers = new(); // 穿墙无伤害衰减玩家
+    // 武器实体索引 → (原始穿透次数, 原始伤害倍率)，用于丢枪/换人时恢复默认属性
+    private readonly Dictionary<uint, (int origPen, float origDmg)> _weaponOrigValues = new();
+
+    // ==================== 自动急停（!cs）====================
+    private readonly HashSet<int> _counterStrafePlayers = new();
 
     // ==================== BOT数量解锁 ====================
     private const int MaxPerTeam = 32;
@@ -107,8 +118,14 @@ public class XRayUnlockerPlugin : BasePlugin
         AddCommand("css_sc", "开关无限蹲起（无体力无冷却）", OnSpamCrouchCommand);
         AddCommand("sc", "控制台无限蹲起: sc 1 开启, sc 0 关闭", OnSpamCrouchConsoleCommand);
         AddCommand("css_stattrak", "暗金JSON管理: stattrakshow [武器名] 或 stattraks<数字>设置基准", OnStattrakJsonCommand);
+        AddCommand("css_wp", "开关全图可穿（子弹穿透任何掩体/材质/地板）", OnWallPenCommand);
+        AddCommand("wp", "控制台全图可穿: wp 1 开启, wp 0 关闭", OnWallPenConsoleCommand);
+        AddCommand("css_wd", "开关穿墙无伤害衰减（穿墙不减伤害，仅保留距离衰减）", OnWallDmgReductionCommand);
+        AddCommand("wd", "控制台穿墙无衰减: wd 1 开启, wd 0 关闭", OnWallDmgReductionConsoleCommand);
+        AddCommand("css_cs", "开关自动急停（松键瞬间停稳，无需反方向键）", OnCounterStrafeCommand);
+        AddCommand("cs", "控制台自动急停: cs 1 开启, cs 0 关闭", OnCounterStrafeConsoleCommand);
 
-        Console.WriteLine("[XRayUnlocker] v1.5.0 已加载 | !x !god !st !nf !sc !stattrak | BOT数量解锁已启用");
+        Console.WriteLine("[XRayUnlocker] v1.5.0 已加载 | !x !god !st !nf !sc !wp !wd !cs !stattrak | BOT数量解锁已启用");
 
         if (hotReload)
         {
@@ -136,6 +153,10 @@ public class XRayUnlockerPlugin : BasePlugin
         _godPlayers.Clear();
         _noFlashPlayers.Clear();
         _noStaminaPlayers.Clear();
+        _fullPenPlayers.Clear();
+        _noWallDmgReductionPlayers.Clear();
+        _counterStrafePlayers.Clear();
+        _weaponOrigValues.Clear();
         _purchasedThisRound.Clear();
         _pawnToSlot.Clear();
         _statTrakValues.Clear();
@@ -351,6 +372,155 @@ public class XRayUnlockerPlugin : BasePlugin
         player.PrintToChat(" [SpamCrouch] 无限蹲起已关闭 - 体力已恢复");
     }
 
+    // ==================== 全图可穿（!wp / wp）====================
+    // 原理：通过修改 CCsWeaponBase 实体的穿透次数(m_nPenetrationCount)为极高值，
+    // 使子弹可以穿透任何掩体、材质甚至地板。
+    // 每帧检测武器切换，仅在新武器时写入，避免重复 Schema 操作。
+
+    private void OnWallPenCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        int slot = player.Slot;
+
+        if (_fullPenPlayers.Contains(slot))
+        {
+            _fullPenPlayers.Remove(slot);
+            RestorePlayerActiveWeaponIfNeeded(player);
+            player.PrintToChat(" [WallPen] 全图可穿已关闭");
+        }
+        else
+        {
+            _fullPenPlayers.Add(slot);
+            var wpn = player.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value;
+            if (wpn is { IsValid: true })
+                ModifyWeaponForFeatures(wpn, slot);
+            player.PrintToChat(" [WallPen] 全图可穿已开启 - 子弹穿透任何掩体/材质/地板");
+        }
+    }
+
+    private void OnWallPenConsoleCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        int slot = player.Slot;
+
+        if (info.ArgCount < 2)
+        {
+            player.PrintToChat(" [WallPen] 用法: wp 1 开启 / wp 0 关闭");
+            return;
+        }
+
+        if (int.TryParse(info.GetArg(1), out int val) && val == 0)
+        {
+            _fullPenPlayers.Remove(slot);
+            RestorePlayerActiveWeaponIfNeeded(player);
+            player.PrintToChat(" [WallPen] 全图可穿已关闭");
+        }
+        else
+        {
+            _fullPenPlayers.Add(slot);
+            var wpn2 = player.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value;
+            if (wpn2 is { IsValid: true })
+                ModifyWeaponForFeatures(wpn2, slot);
+            player.PrintToChat(" [WallPen] 全图可穿已开启 - 子弹穿透任何掩体/材质/地板");
+        }
+    }
+
+    // ==================== 穿墙无伤害衰减（!wd / wd）====================
+    // 原理：修改武器实体的穿透伤害保留率，使穿墙后伤害不衰减，
+    // 仅保留距离带来的正常子弹伤害衰减。
+
+    private void OnWallDmgReductionCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        int slot = player.Slot;
+
+        if (_noWallDmgReductionPlayers.Contains(slot))
+        {
+            _noWallDmgReductionPlayers.Remove(slot);
+            RestorePlayerActiveWeaponIfNeeded(player);
+            player.PrintToChat(" [WallDmg] 穿墙无衰减已关闭");
+        }
+        else
+        {
+            _noWallDmgReductionPlayers.Add(slot);
+            var wd1 = player.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value;
+            if (wd1 is { IsValid: true })
+                ModifyWeaponForFeatures(wd1, slot);
+            player.PrintToChat(" [WallDmg] 穿墙无衰减已开启 - 穿墙不减伤害，仅保留距离衰减");
+        }
+    }
+
+    private void OnWallDmgReductionConsoleCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        int slot = player.Slot;
+
+        if (info.ArgCount < 2)
+        {
+            player.PrintToChat(" [WallDmg] 用法: wd 1 开启 / wd 0 关闭");
+            return;
+        }
+
+        if (int.TryParse(info.GetArg(1), out int val) && val == 0)
+        {
+            _noWallDmgReductionPlayers.Remove(slot);
+            RestorePlayerActiveWeaponIfNeeded(player);
+            player.PrintToChat(" [WallDmg] 穿墙无衰减已关闭");
+        }
+        else
+        {
+            _noWallDmgReductionPlayers.Add(slot);
+            var wd2 = player.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value;
+            if (wd2 is { IsValid: true })
+                ModifyWeaponForFeatures(wd2, slot);
+            player.PrintToChat(" [WallDmg] 穿墙无衰减已开启 - 穿墙不减伤害，仅保留距离衰减");
+        }
+    }
+
+    // ==================== 自动急停（!cs / cs）====================
+    // 原理：OnTick 检测松键瞬间，水平方向键全释放时立刻将水平速度归零，
+    // 模拟完美反方向急停。不影响 peek（peek 时至少有一个方向键按住，不会触发）。
+
+    private void OnCounterStrafeCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        int slot = player.Slot;
+
+        if (_counterStrafePlayers.Contains(slot))
+        {
+            _counterStrafePlayers.Remove(slot);
+            player.PrintToChat(" [CounterStrafe] 自动急停已关闭");
+        }
+        else
+        {
+            _counterStrafePlayers.Add(slot);
+            player.PrintToChat(" [CounterStrafe] 自动急停已开启 - 松键瞬间自动停稳");
+        }
+    }
+
+    private void OnCounterStrafeConsoleCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        int slot = player.Slot;
+
+        if (info.ArgCount < 2)
+        {
+            player.PrintToChat(" [CounterStrafe] 用法: cs 1 开启 / cs 0 关闭");
+            return;
+        }
+
+        if (int.TryParse(info.GetArg(1), out int val) && val == 0)
+        {
+            _counterStrafePlayers.Remove(slot);
+            player.PrintToChat(" [CounterStrafe] 自动急停已关闭");
+        }
+        else
+        {
+            _counterStrafePlayers.Add(slot);
+            player.PrintToChat(" [CounterStrafe] 自动急停已开启 - 松键瞬间自动停稳");
+        }
+    }
+
     // ==================== 暗金计数器 ====================
 
     private void OnStatTrakCommand(CCSPlayerController? player, CommandInfo info)
@@ -541,6 +711,10 @@ public class XRayUnlockerPlugin : BasePlugin
         // 立即绑定并写值，不等 OnTick，防止切后台时 OnTick 迟迟不触发导致显示真实击杀值
         var entry = typeDict[designerName];
         typeDict[designerName] = (weapon.Index, entry.Value);
+
+        // 穿墙功能：新武器入手时立即修改穿透属性，不等下一帧 OnTick
+        ApplyWeaponPenFeatures(player, weapon);
+
         // 如果武器已经是暗金（InvSim 已套皮），立即写值覆盖真实击杀数
         if (WeaponHasStatTrak(weapon))
             ApplyStatTrakValue(weapon, entry.Value);
@@ -593,21 +767,49 @@ public class XRayUnlockerPlugin : BasePlugin
         if (string.IsNullOrEmpty(evWeapon)) return HookResult.Continue;
         string designerName = evWeapon.StartsWith("weapon_") ? evWeapon : "weapon_" + evWeapon;
 
-        if (!_statTrakValues.TryGetValue(slot, out var typeDict)
-            || !typeDict.TryGetValue(designerName, out var entry))
+        // 从物品栏找到真正造成击杀的武器实体（而不是当前手持武器，防止切枪后错判）
+        var weapons = attacker.PlayerPawn?.Value?.WeaponServices?.MyWeapons;
+        CBasePlayerWeapon? killWeapon = null;
+        if (weapons != null)
+        {
+            foreach (var wh in weapons)
+            {
+                var w = wh.Value;
+                if (w is { IsValid: true } && w.DesignerName == designerName)
+                {
+                    killWeapon = w;
+                    break;
+                }
+            }
+        }
+
+        if (killWeapon == null)
             return HookResult.Continue;
 
-        var weapon = attacker.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value;
-        if (weapon is not { IsValid: true })
+        // 武器是暗金枪才计数
+        if (!WeaponHasStatTrak(killWeapon))
             return HookResult.Continue;
+
+        // 若玩家从未用 !st 设定过该武器的值，自动以武器当前击杀数为基准初始化
+        if (!_statTrakValues.TryGetValue(slot, out var typeDict))
+        {
+            typeDict = new Dictionary<string, (uint, int)>();
+            _statTrakValues[slot] = typeDict;
+        }
+        if (!typeDict.TryGetValue(designerName, out var entry))
+        {
+            int baseValue = killWeapon.FallbackStatTrak >= 0 ? killWeapon.FallbackStatTrak : 0;
+            entry = (0, baseValue);
+            typeDict[designerName] = entry;
+        }
 
         // 多条件综合判断：这枪属于自己吗？
-        if (!ShouldClaimWeapon(attacker, weapon, entry.EntityIndex, designerName, entry.Value))
+        if (!ShouldClaimWeapon(attacker, killWeapon, entry.EntityIndex, designerName, entry.Value))
             return HookResult.Continue;
 
         int newValue = entry.Value + 1;
-        typeDict[designerName] = (weapon.Index, newValue);
-        ApplyStatTrakValue(weapon, newValue);
+        typeDict[designerName] = (killWeapon.Index, newValue);
+        ApplyStatTrakValue(killWeapon, newValue);
 
         // JSON 持久化记录
         IncrementJsonKillCount(attacker, designerName);
@@ -664,6 +866,9 @@ public class XRayUnlockerPlugin : BasePlugin
 
         // 清空本回合购买记录
         _purchasedThisRound.Clear();
+
+        // 新回合所有武器重置，清空穿透修改备份
+        _weaponOrigValues.Clear();
 
         // 多级重试兜底：pawn、CBodyComponent、SceneNode 都可能在换局后延迟就绪
         AddTimer(0.2f, () => RebuildAllPlayerStates());
@@ -753,12 +958,16 @@ public class XRayUnlockerPlugin : BasePlugin
     /// </summary>
     private void OnTick()
     {
+        bool hasWallPen = _fullPenPlayers.Count > 0;
+        bool hasNoWallDmg = _noWallDmgReductionPlayers.Count > 0;
+        bool hasOrphanedWeapons = _weaponOrigValues.Count > 0; // 有被修改的武器待恢复（丢地上的枪等）
+        bool hasCounterStrafe = _counterStrafePlayers.Count > 0;
         bool hasGod = _godPlayers.Count > 0;
         bool hasXray = _xrayUsers.Count > 0;
         bool hasStatTrak = _statTrakValues.Count > 0;
         bool hasNoFlash = _noFlashPlayers.Count > 0;
         bool hasStamina = _noStaminaPlayers.Count > 0;
-        if (!hasGod && !hasXray && !hasStatTrak && !hasNoFlash && !hasStamina) return;
+        if (!hasGod && !hasXray && !hasStatTrak && !hasNoFlash && !hasStamina && !hasWallPen && !hasNoWallDmg && !hasOrphanedWeapons && !hasCounterStrafe) return;
 
         _tickCounter++;
 
@@ -796,6 +1005,28 @@ public class XRayUnlockerPlugin : BasePlugin
                 }
             }
 
+            // ===== 穿墙功能：全图可穿 + 无衰减 =====
+            // 对每个玩家：开启功能 → 确保武器已修改；未开启 → 确保武器已恢复默认
+            {
+                var weapon = player.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value;
+                if (weapon is { IsValid: true })
+                {
+                    bool hasFullPen = _fullPenPlayers.Contains(slot);
+                    bool hasNoDmg = _noWallDmgReductionPlayers.Contains(slot);
+
+                    if (hasFullPen || hasNoDmg)
+                    {
+                        // 玩家开启了穿墙功能 → 确保武器被修改
+                        ModifyWeaponForFeatures(weapon, slot);
+                    }
+                    else
+                    {
+                        // 玩家未开启穿墙 → 如果武器曾被修改，恢复默认
+                        RestoreWeaponIfModified(weapon);
+                    }
+                }
+            }
+
             // 暗金覆盖与绑定：
             // 只对自己绑定的武器写值，不污染别人的枪
             if (hasStatTrak && _statTrakValues.TryGetValue(slot, out var typeDict))
@@ -815,6 +1046,28 @@ public class XRayUnlockerPlugin : BasePlugin
                             ApplyStatTrakValue(weapon, entry.Value);
                         }
                         // 未认领 → 不写值（不污染别人的枪）
+                    }
+                }
+            }
+
+            // ===== 自动急停：松键瞬间水平速度归零 =====
+            // 仅当 WASD 四个方向键全部松开且在地面时触发，不影响 peek/连跳/空中移动
+            if (hasCounterStrafe && _counterStrafePlayers.Contains(slot))
+            {
+                var cspawn = player.PlayerPawn?.Value;
+                if (cspawn is { IsValid: true } && (cspawn.Flags & 1) != 0) // FL_ONGROUND
+                {
+                    var buttons = player.Buttons;
+                    bool hasHorizontalInput = (buttons & PlayerButtons.Forward) != 0
+                                           || (buttons & PlayerButtons.Back) != 0
+                                           || (buttons & PlayerButtons.Moveleft) != 0
+                                           || (buttons & PlayerButtons.Moveright) != 0;
+
+                    if (!hasHorizontalInput)
+                    {
+                        var vel = cspawn.AbsVelocity;
+                        if (vel != null && (vel.X != 0 || vel.Y != 0))
+                            cspawn.Teleport(null, null, new Vector(0, 0, vel.Z));
                     }
                 }
             }
@@ -1097,6 +1350,222 @@ public class XRayUnlockerPlugin : BasePlugin
 
         Server.ExecuteCommand("mp_autoteambalance 0");
         Server.ExecuteCommand("mp_limitteams 0");
+    }
+
+    // ==================== 穿墙功能：Schema 修改辅助 ====================
+    // 核心思路：修改武器前先备份原始值 → 丢枪/换人时恢复 → 捡枪后再判断新主人是否需要
+    // _weaponOrigValues: weaponIndex → (origPen, origDmg)，只存已被修改的武器
+
+    /// <summary>
+    /// 武器入手时调用（OnWeaponEntityCreated）。如果主人开启了穿墙功能则立即修改。
+    /// </summary>
+    private void ApplyWeaponPenFeatures(CCSPlayerController player, CBasePlayerWeapon weapon)
+    {
+        if (weapon is not { IsValid: true }) return;
+        ModifyWeaponForFeatures(weapon, player.Slot);
+    }
+
+    /// <summary>
+    /// 根据 slot 对应的玩家功能状态，修改武器穿透属性。
+    /// 首次修改该武器时自动读取并备份原始值。
+    /// 已在 _weaponOrigValues 中存在则跳过（已修改过，避免重复 Schema 操作）。
+    /// 当玩家两种功能都没开时不调用此方法。
+    /// </summary>
+    private void ModifyWeaponForFeatures(CBasePlayerWeapon weapon, int slot)
+    {
+        if (weapon is not { IsValid: true }) return;
+        uint idx = weapon.Index;
+
+        bool hasFullPen = _fullPenPlayers.Contains(slot);
+        bool hasNoDmg = _noWallDmgReductionPlayers.Contains(slot);
+        if (!hasFullPen && !hasNoDmg) return; // 玩家没开任何穿墙功能
+
+        // 已修改过的武器跳过（避免每帧重复 Schema 调用）
+        if (_weaponOrigValues.ContainsKey(idx)) return;
+
+        // 首次修改：先读取并备份原始值
+        int origPen = TryGetWeaponPenetration(weapon);
+        float origDmg = TryGetWeaponPenDmgModifier(weapon);
+        _weaponOrigValues[idx] = (origPen, origDmg);
+
+        // 写入目标值
+        if (hasFullPen) TrySetWeaponPenetration(weapon, 128);   // 极高穿透次数
+        if (hasNoDmg)   TrySetWeaponPenDmgModifier(weapon, 1.0f); // 100%伤害保留
+    }
+
+    /// <summary>
+    /// 如果武器曾被修改（存在 _weaponOrigValues 中），恢复其原始穿透属性并移除备份。
+    /// 用于武器落入未开启穿墙功能的玩家手中时自动恢复。
+    /// </summary>
+    private void RestoreWeaponIfModified(CBasePlayerWeapon weapon)
+    {
+        if (weapon is not { IsValid: true }) return;
+        uint idx = weapon.Index;
+
+        if (!_weaponOrigValues.TryGetValue(idx, out var orig)) return;
+
+        TrySetWeaponPenetration(weapon, orig.origPen);
+        TrySetWeaponPenDmgModifier(weapon, orig.origDmg);
+        _weaponOrigValues.Remove(idx);
+    }
+
+    /// <summary>
+    /// 玩家关闭穿墙功能时调用：恢复其当前持有武器的默认属性
+    /// （仅当该武器没有被其他开启功能的玩家也持有时才恢复）
+    /// </summary>
+    private void RestorePlayerActiveWeaponIfNeeded(CCSPlayerController player)
+    {
+        var weapon = player.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value;
+        if (weapon is not { IsValid: true }) return;
+
+        uint idx = weapon.Index;
+        if (!_weaponOrigValues.ContainsKey(idx)) return; // 未被修改过，无需恢复
+
+        // 检查该武器是否还有其他人需要穿透功能
+        // 遍历所有玩家，看是否有开启功能的玩家持有同一把枪
+        bool stillNeeded = false;
+        foreach (var p in Utilities.GetPlayers())
+        {
+            if (p is not { IsValid: true }) continue;
+            if (p.Slot == player.Slot) continue;
+            if (!_fullPenPlayers.Contains(p.Slot) && !_noWallDmgReductionPlayers.Contains(p.Slot)) continue;
+
+            var w = p.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value;
+            if (w is { IsValid: true } && w.Index == idx)
+            {
+                stillNeeded = true;
+                break;
+            }
+        }
+
+        if (!stillNeeded)
+            RestoreWeaponIfModified(weapon);
+    }
+
+    // ---- 底层 Schema 读写：优先 VData（武器真实参数所在），实体字段作备选 ----
+    // VData 是所有同款武器共享的模板数据，修改 VData 会影响全局（本地服可接受）
+    // 恢复时用硬编码默认值（2 穿透 / 0.5 伤害倍率），因 Schema.GetSchemaValue 不一定可用
+
+    /// <summary>获取武器 VData 句柄。CS2 武器穿透/射程等参数存储在 VData 而非实体上。</summary>
+    private static nint TryGetWeaponVData(CBasePlayerWeapon weapon)
+    {
+        try { return Schema.GetSchemaValue<nint>(weapon.Handle, "CEntityInstance", "m_pVData"); }
+        catch
+        {
+            try { return Schema.GetSchemaValue<nint>(weapon.Handle, "CBaseEntity", "m_pVData"); }
+            catch { return nint.Zero; }
+        }
+    }
+
+    /// <summary>读取武器当前穿透次数，用于备份。读取失败返回 2。</summary>
+    private static int TryGetWeaponPenetration(CBasePlayerWeapon weapon)
+    {
+        nint vdata = TryGetWeaponVData(weapon);
+        if (vdata != nint.Zero)
+        {
+            try { return Schema.GetSchemaValue<int>(vdata, "CCSWeaponBaseVData", "m_nPenetrationCount"); }
+            catch { }
+        }
+        try { return Schema.GetSchemaValue<int>(weapon.Handle, "CCSWeaponBase", "m_nPenetrationCount"); }
+        catch { return 2; }
+    }
+
+    /// <summary>读取武器穿透伤害倍率，用于备份。读取失败返回 0.5f。</summary>
+    private static float TryGetWeaponPenDmgModifier(CBasePlayerWeapon weapon)
+    {
+        nint vdata = TryGetWeaponVData(weapon);
+        if (vdata != nint.Zero)
+        {
+            try { return Schema.GetSchemaValue<float>(vdata, "CCSWeaponBaseVData", "m_flPenetrationDamageModifier"); }
+            catch { }
+        }
+        try { return Schema.GetSchemaValue<float>(weapon.Handle, "CCSWeaponBase", "m_flPenetrationDamageModifier"); }
+        catch { return 0.5f; }
+    }
+
+    /// <summary>
+    /// 设置武器穿透次数（全图可穿）—— 带调试日志版。
+    /// 穷举所有可能字段名，控制台会打印命中情况，方便排查。命中一次后跳过后续尝试。
+    /// </summary>
+    private static void TrySetWeaponPenetration(CBasePlayerWeapon weapon, int value)
+    {
+        nint vdata = TryGetWeaponVData(weapon);
+        var handle = weapon.Handle;
+        string dn = weapon.DesignerName;
+        Console.WriteLine($"[WP Debug] {dn} | entity handle={handle} | vdata={vdata}");
+
+        // === VData 上的穿透字段（穷举） ===
+        if (vdata != nint.Zero)
+        {
+            TrySchemaInt(vdata, "CCSWeaponBaseVData", "m_nPenetrationCount", value,
+                $"VData m_nPenetrationCount={value}");
+            TrySchemaInt(vdata, "CCSWeaponBaseVData", "m_nPenetration", value,
+                $"VData m_nPenetration={value}");
+            TrySchemaInt(vdata, "CWeaponCSBaseVData", "m_nPenetrationCount", value,
+                $"VData(CWeapon) m_nPenetrationCount={value}");
+            TrySchemaInt(vdata, "CCSWeaponBaseVData", "m_iPenetrationCount", value,
+                $"VData m_iPenetrationCount={value}");
+            TrySchemaFloat(vdata, "CCSWeaponBaseVData", "m_flPenetration", (float)value,
+                $"VData m_flPenetration={value}");
+            TrySchemaFloat(vdata, "CCSWeaponBaseVData", "m_flPenetrationPower", (float)value,
+                $"VData m_flPenetrationPower={value}");
+
+            // VData 射程
+            TrySchemaFloat(vdata, "CCSWeaponBaseVData", "m_flRange", 99999f,
+                $"VData m_flRange=99999");
+            TrySchemaFloat(vdata, "CCSWeaponBaseVData", "m_flMaxRange", 99999f,
+                $"VData m_flMaxRange=99999");
+            TrySchemaFloat(vdata, "CWeaponCSBaseVData", "m_flRange", 99999f,
+                $"VData(CWeapon) m_flRange=99999");
+        }
+
+        // === 实体上的穿透字段（穷举） ===
+        TrySchemaInt(handle, "CCSWeaponBase", "m_nPenetrationCount", value,
+            $"Entity m_nPenetrationCount={value}");
+        TrySchemaInt(handle, "CBasePlayerWeapon", "m_nPenetrationCount", value,
+            $"Entity(CBase) m_nPenetrationCount={value}");
+        TrySchemaInt(handle, "CWeaponCSBase", "m_nPenetrationCount", value,
+            $"Entity(CWeapon) m_nPenetrationCount={value}");
+        TrySchemaFloat(handle, "CCSWeaponBase", "m_flPenetration", (float)value,
+            $"Entity m_flPenetration={value}");
+    }
+
+    /// <summary>设置武器穿墙伤害保留倍率（无衰减 = 1.0）—— 带调试日志版。</summary>
+    private static void TrySetWeaponPenDmgModifier(CBasePlayerWeapon weapon, float value)
+    {
+        nint vdata = TryGetWeaponVData(weapon);
+        var handle = weapon.Handle;
+
+        if (vdata != nint.Zero)
+        {
+            TrySchemaFloat(vdata, "CCSWeaponBaseVData", "m_flPenetrationDamageModifier", value,
+                $"VData m_flPenetrationDamageModifier={value}");
+            TrySchemaFloat(vdata, "CCSWeaponBaseVData", "m_flPenetrationDamage", value,
+                $"VData m_flPenetrationDamage={value}");
+            TrySchemaFloat(vdata, "CCSWeaponBaseVData", "m_flDamagePenetration", value,
+                $"VData m_flDamagePenetration={value}");
+        }
+
+        TrySchemaFloat(handle, "CCSWeaponBase", "m_flPenetrationDamageModifier", value,
+            $"Entity m_flPenetrationDamageModifier={value}");
+        TrySchemaFloat(handle, "CBasePlayerWeapon", "m_flPenetrationDamageModifier", value,
+            $"Entity(CBase) m_flPenetrationDamageModifier={value}");
+        TrySchemaFloat(handle, "CCSWeaponBase", "m_flPenetrationDamage", value,
+            $"Entity m_flPenetrationDamage={value}");
+        TrySchemaFloat(handle, "CCSWeaponBase", "m_flDamageWallModifier", value,
+            $"Entity m_flDamageWallModifier={value}");
+    }
+
+    // ---- Schema 写值小助手（带日志）----
+    private static void TrySchemaInt(nint handle, string className, string fieldName, int value, string logMsg)
+    {
+        try { Schema.SetSchemaValue<int>(handle, className, fieldName, value); Console.WriteLine($"[WP OK] {logMsg}"); }
+        catch (Exception ex) { Console.WriteLine($"[WP MISS] {className}::{fieldName} — {ex.Message}"); }
+    }
+    private static void TrySchemaFloat(nint handle, string className, string fieldName, float value, string logMsg)
+    {
+        try { Schema.SetSchemaValue<float>(handle, className, fieldName, value); Console.WriteLine($"[WP OK] {logMsg}"); }
+        catch (Exception ex) { Console.WriteLine($"[WP MISS] {className}::{fieldName} — {ex.Message}"); }
     }
 
     // ==================== 暗金JSON持久化 ====================

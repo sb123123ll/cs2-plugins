@@ -6,7 +6,7 @@
 
 | 插件 | 功能 |
 |------|------|
-| **XRayUnlocker** | `!x` 透视 / `!god` 无敌 / `!st` 修改暗金计数 / `!nf` 防闪 / `!sc` 无限蹲起 / `!stattrak` 暗金持久化 / BOT数量解锁 |
+| **XRayUnlocker** | `!x` 透视 / `!god` 无敌 / `!st` 修改暗金计数 / `!nf` 防闪 / `!sc` 无限蹲起 / `!wp` 全图可穿 / `!wd` 穿墙无衰减 / `!stattrak` 暗金持久化 / BOT数量解锁 |
 
 ---
 
@@ -49,6 +49,8 @@ game/csgo/addons/counterstrikesharp/plugins/
 | `!st <数字>` 或 `st <数字>` | 修改当前武器暗金计数器，击杀在设定值上递增 |
 | `!nf` 或 `nf 1/0` | 开关防闪光白屏 |
 | `!sc` 或 `sc 1/0` | 开关无限蹲起（无体力无冷却，如瓦罗兰特） |
+| `!wp` 或 `wp 1/0` | 开关全图可穿（子弹穿透任何掩体/材质/地板） |
+| `!wd` 或 `wd 1/0` | 开关穿墙无衰减（穿墙不减伤害，仅保留距离衰减） |
 | `!stattrak show` | 查看当前武器累计击杀（JSON 持久化） |
 | `!stattrak show <武器名>` | 查看指定武器累计击杀（如 `!stattrak show ak47`） |
 | `!stattrak <数字>` | 设置当前武器 JSON 计数基准 |
