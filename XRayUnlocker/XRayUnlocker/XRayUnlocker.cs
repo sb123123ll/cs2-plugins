@@ -1,4 +1,5 @@
 using System.Drawing;
+using System.Reflection;
 using System.Text.Json;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
@@ -14,7 +15,7 @@ using CounterStrikeSharp.API.Modules.Utils;
 namespace XRayUnlocker;
 
 /// <summary>
-/// 本地透视 + 无敌插件 v1.4.0
+/// 本地透视 + 无敌插件 v1.8.0
 /// 
 /// 玩家透视（!x）：
 ///   创建不可见 prop_dynamic 幽灵发光实体跟随玩家模型，
@@ -25,17 +26,18 @@ namespace XRayUnlocker;
 ///   不掉血、不抖动、不减速，子弹正常命中，击中效果完整。
 ///   机制：OnPlayerTakeDamagePre 在引擎层面将伤害归零。
 ///
-/// 暗金计数（!st）—— v1.4.0 重写为"最高权重"系统：
-///   每帧强制覆盖，InvSim 和原版暗金代码均无法干涉。
-///   数据结构：slot → DesignerName → value（单层，按武器型号存储）。
+/// 暗金计数（!st）—— v1.6.0 重写为简单值模型：
+///   移除实体绑定/购买追踪/认领判定三层机制，
+///   改为 slot → designerName → value 直接映射，
+///   玩家设过值的武器类型始终递增，无指纹断裂风险。
 /// </summary>
 [MinimumApiVersion(80)]
 public class XRayUnlockerPlugin : BasePlugin
 {
     public override string ModuleName => "XRayUnlocker";
-    public override string ModuleVersion => "1.5.0";
+    public override string ModuleVersion => "1.8.1";
     public override string ModuleAuthor => "CS2 Local Server";
-    public override string ModuleDescription => "透视 !x + 无敌 !god + 暗金 !st + 防闪 !nf + 蹲起 !sc + 全图可穿 !wp + 穿墙无衰减 !wd + BOT数量解锁 + 暗金JSON持久化 !stattrak";
+    public override string ModuleDescription => "透视 !x + 无敌 !god + 暗金 !st + 防闪 !nf + 蹲起 !sc + 全图可穿 !wp + 穿墙无衰减 !wd + 自动急停 !cs + 魔法子弹 !mb + 掉落物透视 !dx + C4透视 !cx + 隐身 !inv + 秒下包秒拆弹 !fb + BOT数量解锁 + 暗金JSON持久化 !stattrak";
 
     // ==================== 玩家透视 ====================
     private readonly Dictionary<int, (CDynamicProp relay, CDynamicProp glow)> _playerGlows = new();
@@ -64,19 +66,249 @@ public class XRayUnlockerPlugin : BasePlugin
     // ==================== 自动急停（!cs）====================
     private readonly HashSet<int> _counterStrafePlayers = new();
 
+    // ==================== 魔法子弹（!mb）====================
+    // 开火时自动将子弹导向最近敌人（头部 65% / 身体 35%），瞄准容差 ±10°
+    private readonly HashSet<int> _magicBulletPlayers = new();
+
+    // ==================== 掉落物透视（!dx）====================
+    // 创建 CDynamicProp 跟随地上武器（双实体 relay+glow），
+    // 模型固定用 AK-47 世界模型（CS2 保证存在，不会 ERROR）
+    private readonly HashSet<int> _dropXrayUsers = new();
+    private readonly Dictionary<nint, (CDynamicProp relay, CDynamicProp glow)> _dropGlows = new();
+
+    // ==================== C4透视（!cx）====================
+    private readonly HashSet<int> _c4XrayUsers = new();
+    private (CDynamicProp relay, CDynamicProp glow)? _c4GlowPair = null;
+    private CPlantedC4? _c4Entity = null;
+    private int _c4FlashTick;
+
+    // ==================== 隐身（!inv）====================
+    // 原理：玩家/武器/手套 alpha 置 0 + 影子强度归零，并在 CheckTransmit 中
+    // 阻止其他玩家接收该玩家实体；设置 FL_NOTARGET 让 BOT 的目标感知失效。
+    private readonly HashSet<int> _invisiblePlayers = new();
+    private readonly Dictionary<CEntityInstance, int> _hiddenEntities = new(); // 隐藏实体 → 拥有者 slot
+    private const uint FL_NOTARGET = 0x8000u; // m_fFlags 位：AI 不把该实体作为目标（对应 notarget）
+
+    // ==================== 秒下包/秒拆弹（!fb）====================
+    // 原理：拦截 bomb_beginplant / bomb_begindefuse 事件，
+    // 将 C4 下包耗时（ArmedTime）或拆弹倒计时（DefuseCountDown）归零。
+    private readonly HashSet<int> _fastBombPlayers = new();
+
     // ==================== BOT数量解锁 ====================
     private const int MaxPerTeam = 32;
     private readonly List<string> _createdSpawnGlobalnames = new();
 
-    // ==================== 暗金计数器（v1.4.0 最高权重 + 实体防感染）====================
-    // slot → DesignerName → (EntityIndex, Value)
-    // EntityIndex 绑定"自己的枪"实体，击杀时仅匹配实体才递增，捡来的枪杀了不计
-    // 每回合开始 EntityIndex 重置为 0，通过购买事件 + 背包唯一性双重验证自动绑定
-    // OnTick 每帧强制写回值（显示），InvSim/原版暗金无法干涉
-    private readonly Dictionary<int, Dictionary<string, (uint EntityIndex, int Value)>> _statTrakValues = new();
-    // 追踪玩家本回合购买的武器（slot → designerName 集合）
-    // 用于新回合认领：买过的枪一定属于自己，跳过所有歧义检查
-    private readonly Dictionary<int, HashSet<string>> _purchasedThisRound = new();
+    // ==================== 掉落物透视（!dx / dx）====================
+    // 创建双实体（relay + glow）跟随地上武器，模型用 AK-47 世界模型（CS2 保证存在）
+
+    private void OnDropXrayCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        int slot = player.Slot;
+        if (_dropXrayUsers.Contains(slot))
+        {
+            _dropXrayUsers.Remove(slot);
+            DestroyAllDropGlows();
+            player.PrintToChat(" [DropXray] 掉落物透视已关闭");
+        }
+        else
+        {
+            _dropXrayUsers.Add(slot);
+            player.PrintToChat(" [DropXray] 掉落物透视已开启 - 地上武器/道具/拆弹器 淡黄边框");
+        }
+    }
+
+    private void OnDropXrayConsoleCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        int slot = player.Slot;
+        if (info.ArgCount < 2) { player.PrintToChat(" [DropXray] 用法: dx 1 开启 / dx 0 关闭"); return; }
+        if (int.TryParse(info.GetArg(1), out int val) && val == 0)
+        { _dropXrayUsers.Remove(slot); DestroyAllDropGlows(); player.PrintToChat(" [DropXray] 掉落物透视已关闭"); }
+        else
+        { _dropXrayUsers.Add(slot); player.PrintToChat(" [DropXray] 掉落物透视已开启 - 地上武器/道具/拆弹器 淡黄边框"); }
+    }
+
+    private static readonly string[] AllWeaponDesignerNames =
+    {
+        "weapon_ak47", "weapon_m4a1", "weapon_m4a1_silencer", "weapon_aug", "weapon_sg556",
+        "weapon_awp", "weapon_ssg08", "weapon_scar20", "weapon_g3sg1",
+        "weapon_galilar", "weapon_famas", "weapon_deagle", "weapon_revolver",
+        "weapon_elite", "weapon_fiveseven", "weapon_p250", "weapon_usp_silencer",
+        "weapon_glock", "weapon_hkp2000", "weapon_cz75a", "weapon_tec9",
+        "weapon_mp9", "weapon_mac10", "weapon_mp7", "weapon_mp5sd", "weapon_ump45",
+        "weapon_p90", "weapon_bizon",
+        "weapon_nova", "weapon_xm1014", "weapon_mag7", "weapon_sawedoff",
+        "weapon_m249", "weapon_negev",
+        "weapon_knife", "weapon_knife_t", "weapon_bayonet",
+        "weapon_flashbang", "weapon_hegrenade", "weapon_smokegrenade",
+        "weapon_decoy", "weapon_molotov", "weapon_incgrenade",
+        "weapon_taser", "weapon_healthshot",
+        "weapon_c4", "item_defuser", "item_cutters",
+    };
+
+    /// <summary>AK-47 世界模型路径（CS2 保证存在，用作所有掉落物的发光载体）</summary>
+    private const string GlowMarkerModel = "models/weapons/w_rif_ak47.vmdl";
+
+    /// <summary>为物品创建跟随的双实体发光组</summary>
+    private static (CDynamicProp relay, CDynamicProp glow)? CreateItemGlow(CEntityInstance target, Color color)
+    {
+        if (!target.IsValid) return null;
+
+        var relay = Utilities.CreateEntityByName<CDynamicProp>("prop_dynamic");
+        if (relay == null || !relay.IsValid) return null;
+
+        relay.SetModel(GlowMarkerModel);
+        relay.Spawnflags = 256u;
+        relay.RenderMode = RenderMode_t.kRenderNone;
+        relay.DispatchSpawn();
+
+        var glow = Utilities.CreateEntityByName<CDynamicProp>("prop_dynamic");
+        if (glow == null || !glow.IsValid) { relay.Remove(); return null; }
+
+        glow.SetModel(GlowMarkerModel);
+        glow.Spawnflags = 256u;
+        glow.Render = Color.FromArgb(1, 255, 255, 255);
+        glow.DispatchSpawn();
+
+        glow.Glow.GlowColorOverride = color;
+        glow.Glow.GlowRange = 5000;
+        glow.Glow.GlowRangeMin = 0;
+        glow.Glow.GlowTeam = -1;
+        glow.Glow.GlowType = 3;
+
+        relay.AcceptInput("FollowEntity", target, relay, "!activator");
+        glow.AcceptInput("FollowEntity", relay, glow, "!activator");
+
+        return (relay, glow);
+    }
+
+    private void UpdateDropGlows()
+    {
+        var seenHandles = new HashSet<nint>();
+
+        foreach (var designerName in AllWeaponDesignerNames)
+        {
+            foreach (var entity in Utilities.FindAllEntitiesByDesignerName<CBasePlayerWeapon>(designerName))
+            {
+                if (entity is not CBasePlayerWeapon weapon || !weapon.IsValid) continue;
+                var owner = weapon.OwnerEntity?.Value;
+                if (owner is { IsValid: true }) continue;
+
+                nint handle = weapon.Handle;
+                seenHandles.Add(handle);
+                if (_dropGlows.ContainsKey(handle)) continue;
+
+                try
+                {
+                    var pair = CreateItemGlow(weapon, Color.Gold);
+                    if (pair != null) _dropGlows[handle] = pair.Value;
+                }
+                catch { }
+            }
+        }
+
+        var stale = _dropGlows.Keys.Where(k => !seenHandles.Contains(k)).ToList();
+        foreach (var key in stale)
+        {
+            if (_dropGlows.TryGetValue(key, out var pair))
+            {
+                if (pair.glow is { IsValid: true }) pair.glow.Remove();
+                if (pair.relay is { IsValid: true }) pair.relay.Remove();
+            }
+            _dropGlows.Remove(key);
+        }
+    }
+
+    private void DestroyAllDropGlows()
+    {
+        foreach (var pair in _dropGlows.Values)
+        {
+            if (pair.glow is { IsValid: true }) pair.glow.Remove();
+            if (pair.relay is { IsValid: true }) pair.relay.Remove();
+        }
+        _dropGlows.Clear();
+    }
+
+    // ==================== C4透视（!cx / cx）====================
+
+    private void OnC4XrayCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        int slot = player.Slot;
+        if (_c4XrayUsers.Contains(slot))
+        {
+            _c4XrayUsers.Remove(slot);
+            DestroyC4Glow();
+            player.PrintToChat(" [C4Xray] C4透视已关闭");
+        }
+        else
+        {
+            _c4XrayUsers.Add(slot);
+            if (_c4Entity is { IsValid: true } && _c4GlowPair == null)
+                _c4GlowPair = CreateItemGlow(_c4Entity, Color.Lime);
+            player.PrintToChat(" [C4Xray] C4透视已开启 - 已激活C4 绿色闪烁边框");
+        }
+    }
+
+    private void OnC4XrayConsoleCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        int slot = player.Slot;
+        if (info.ArgCount < 2) { player.PrintToChat(" [C4Xray] 用法: cx 1 开启 / cx 0 关闭"); return; }
+        if (int.TryParse(info.GetArg(1), out int val) && val == 0)
+        { _c4XrayUsers.Remove(slot); DestroyC4Glow(); player.PrintToChat(" [C4Xray] C4透视已关闭"); }
+        else
+        {
+            _c4XrayUsers.Add(slot);
+            if (_c4Entity is { IsValid: true } && _c4GlowPair == null)
+                _c4GlowPair = CreateItemGlow(_c4Entity, Color.Lime);
+            player.PrintToChat(" [C4Xray] C4透视已开启 - 已激活C4 绿色闪烁边框");
+        }
+    }
+
+    private HookResult OnBombPlanted(EventBombPlanted @event, GameEventInfo info)
+    {
+        DestroyC4Glow();
+        AddTimer(0.1f, () =>
+        {
+            var c4 = Utilities.FindAllEntitiesByDesignerName<CPlantedC4>("planted_c4").FirstOrDefault();
+            if (c4 is not { IsValid: true }) return;
+            _c4Entity = c4;
+            _c4FlashTick = 0;
+            if (_c4XrayUsers.Count > 0)
+                _c4GlowPair = CreateItemGlow(c4, Color.Lime);
+        });
+        return HookResult.Continue;
+    }
+
+    private HookResult OnBombDefused(EventBombDefused @event, GameEventInfo info)
+    {
+        DestroyC4Glow();
+        return HookResult.Continue;
+    }
+
+    private HookResult OnBombExploded(EventBombExploded @event, GameEventInfo info)
+    {
+        DestroyC4Glow();
+        return HookResult.Continue;
+    }
+
+    private void DestroyC4Glow()
+    {
+        if (_c4GlowPair is { } pair)
+        {
+            if (pair.glow is { IsValid: true }) pair.glow.Remove();
+            if (pair.relay is { IsValid: true }) pair.relay.Remove();
+        }
+        _c4GlowPair = null;
+        _c4Entity = null;
+    }
+
+    // ==================== 暗金计数器 ====================
+    // slot → DesignerName → Value（简化为直接值模型，无实体绑定、无购买追踪）
+    // 玩家对某武器类型设过值后，该类型所有击杀始终递增，OnTick 每帧强制写回
+    private readonly Dictionary<int, Dictionary<string, int>> _statTrakValues = new();
 
     // StatTrak JSON 持久化（跨会话保留击杀记录）
     private Dictionary<string, Dictionary<string, int>> _savedKillCounts = new();
@@ -101,8 +333,14 @@ public class XRayUnlockerPlugin : BasePlugin
         RegisterEventHandler<EventPlayerSpawn>(OnPlayerSpawn);
         RegisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
         RegisterEventHandler<EventRoundStart>(OnRoundStart);
+        RegisterEventHandler<EventPlayerDeath>(OnPlayerDeathMagicFix, HookMode.Pre);
         RegisterEventHandler<EventPlayerDeath>(OnPlayerDeathPost, HookMode.Post);
-        RegisterEventHandler<EventItemPurchase>(OnItemPurchase);
+        RegisterEventHandler<EventWeaponFire>(OnWeaponFireMagicBullet);
+        RegisterEventHandler<EventBombPlanted>(OnBombPlanted);
+        RegisterEventHandler<EventBombDefused>(OnBombDefused);
+        RegisterEventHandler<EventBombExploded>(OnBombExploded);
+        RegisterEventHandler<EventBombBeginplant>(OnBombBeginPlant);
+        RegisterEventHandler<EventBombBegindefuse>(OnBombBeginDefuse);
 
         RegisterListener<Listeners.OnMapStart>(OnMapStart);
         AddCommandListener("bot_add", OnBotAddCommand, HookMode.Pre);
@@ -124,8 +362,18 @@ public class XRayUnlockerPlugin : BasePlugin
         AddCommand("wd", "控制台穿墙无衰减: wd 1 开启, wd 0 关闭", OnWallDmgReductionConsoleCommand);
         AddCommand("css_cs", "开关自动急停（松键瞬间停稳，无需反方向键）", OnCounterStrafeCommand);
         AddCommand("cs", "控制台自动急停: cs 1 开启, cs 0 关闭", OnCounterStrafeConsoleCommand);
+        AddCommand("css_mb", "开关魔法子弹（瞄准大致方向自动命中最近敌人）", OnMagicBulletCommand);
+        AddCommand("mb", "控制台魔法子弹: mb 1 开启, mb 0 关闭", OnMagicBulletConsoleCommand);
+        AddCommand("css_dx", "开关掉落物透视（地上武器/道具/拆弹器 淡黄边框）", OnDropXrayCommand);
+        AddCommand("dx", "控制台掉落物透视: dx 1 开启, dx 0 关闭", OnDropXrayConsoleCommand);
+        AddCommand("css_cx", "开关C4透视（已激活C4 绿色闪烁边框）", OnC4XrayCommand);
+        AddCommand("cx", "控制台C4透视: cx 1 开启, cx 0 关闭", OnC4XrayConsoleCommand);
+        AddCommand("css_inv", "开关隐身（模型/枪械/影子消失，BOT 看不见）", OnInvisCommand);
+        AddCommand("inv", "控制台隐身: inv 1 开启, inv 0 关闭", OnInvisConsoleCommand);
+        AddCommand("css_fb", "开关秒下包/秒拆弹（0.1秒，不分阵营）", OnFastBombCommand);
+        AddCommand("fb", "控制台秒下包/秒拆弹: fb 1 开启, fb 0 关闭", OnFastBombConsoleCommand);
 
-        Console.WriteLine("[XRayUnlocker] v1.5.0 已加载 | !x !god !st !nf !sc !wp !wd !cs !stattrak | BOT数量解锁已启用");
+        Console.WriteLine("[XRayUnlocker] v1.8.1 已加载 | !x !god !st !nf !sc !wp !wd !cs !mb !dx !cx !inv !fb !stattrak | BOT数量解锁已启用");
 
         if (hotReload)
         {
@@ -156,8 +404,23 @@ public class XRayUnlockerPlugin : BasePlugin
         _fullPenPlayers.Clear();
         _noWallDmgReductionPlayers.Clear();
         _counterStrafePlayers.Clear();
+        _magicBulletPlayers.Clear();
+        _pendingMagicBulletKills.Clear();
+        _dropXrayUsers.Clear();
+        _c4XrayUsers.Clear();
+        DestroyAllDropGlows();
+        DestroyC4Glow();
+        // 恢复所有隐身玩家并清理
+        foreach (var slot in _invisiblePlayers.ToList())
+        {
+            var p = Utilities.GetPlayerFromSlot(slot);
+            if (p is { IsValid: true })
+                RestoreVisibility(p);
+        }
+        _invisiblePlayers.Clear();
+        _hiddenEntities.Clear();
+        _fastBombPlayers.Clear();
         _weaponOrigValues.Clear();
-        _purchasedThisRound.Clear();
         _pawnToSlot.Clear();
         _statTrakValues.Clear();
         RemoveCreatedSpawns();
@@ -291,6 +554,220 @@ public class XRayUnlockerPlugin : BasePlugin
             _noFlashPlayers.Add(slot);
             player.PrintToChat(" [NoFlash] 防闪光已开启 - 闪光弹不白屏");
         }
+    }
+
+    // ==================== 隐身（!inv / inv）====================
+    // 原理：将玩家及其所有武器渲染 alpha 置 0、影子强度归零，
+    // 同时在 CheckTransmit 中阻止其他玩家接收这些实体；
+    // SpottedState 归零让 BOT 的目标感知也无法发现隐身玩家。
+
+    private void OnInvisCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        ToggleInvisibility(player);
+    }
+
+    private void OnInvisConsoleCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        if (info.ArgCount < 2)
+        {
+            player.PrintToChat(" [Invis] 用法: inv 1 开启 / inv 0 关闭");
+            return;
+        }
+
+        bool enable = !(int.TryParse(info.GetArg(1), out int val) && val == 0);
+        if (enable == _invisiblePlayers.Contains(player.Slot)) return;
+
+        if (enable) SetInvisible(player);
+        else SetVisible(player);
+    }
+
+    private void ToggleInvisibility(CCSPlayerController player)
+    {
+        if (_invisiblePlayers.Contains(player.Slot)) SetVisible(player);
+        else SetInvisible(player);
+    }
+
+    private void SetInvisible(CCSPlayerController player)
+    {
+        _invisiblePlayers.Add(player.Slot);
+        ApplyInvisibility(player);
+        player.PrintToChat(" [Invis] 隐身已开启 - 模型/枪械/影子消失，BOT 也看不见");
+    }
+
+    private void SetVisible(CCSPlayerController player)
+    {
+        _invisiblePlayers.Remove(player.Slot);
+        RestoreVisibility(player);
+        player.PrintToChat(" [Invis] 隐身已关闭 - 已恢复可见");
+    }
+
+    /// <summary>将玩家及其所有武器/手套设为不可见，并登记到 CheckTransmit 屏蔽集合。</summary>
+    private void ApplyInvisibility(CCSPlayerController player)
+    {
+        var pawn = player.PlayerPawn?.Value;
+        if (pawn is not { IsValid: true }) return;
+
+        // 玩家本体：alpha 0 + 影子归零 + 取消被发现标记 + 让 BOT 忽略
+        pawn.Render = Color.FromArgb(0, pawn.Render);
+        Utilities.SetStateChanged(pawn, "CBaseModelEntity", "m_clrRender");
+        pawn.ShadowStrength = 0f;
+        Utilities.SetStateChanged(pawn, "CBaseModelEntity", "m_flShadowStrength");
+        pawn.EntitySpottedState.Spotted = false;
+        pawn.EntitySpottedState.SpottedByMask[0] = 0;
+        pawn.Flags |= FL_NOTARGET;
+        Utilities.SetStateChanged(pawn, "CBaseEntity", "m_fFlags");
+        _hiddenEntities[pawn] = player.Slot;
+
+        // 所有武器（主武器/副武器/刀/投掷物）：一并隐藏
+        var weapons = pawn.WeaponServices?.MyWeapons;
+        if (weapons != null)
+        {
+            foreach (var handle in weapons)
+            {
+                var weapon = handle.Value;
+                if (weapon is not { IsValid: true }) continue;
+
+                weapon.Render = Color.FromArgb(0, weapon.Render);
+                Utilities.SetStateChanged(weapon, "CBaseModelEntity", "m_clrRender");
+                weapon.ShadowStrength = 0f;
+                Utilities.SetStateChanged(weapon, "CBaseModelEntity", "m_flShadowStrength");
+                _hiddenEntities[weapon] = player.Slot;
+            }
+        }
+
+        // 手套（CEconWearable）：一并隐藏，避免只有手套露出来
+        var wearables = pawn.MyWearables;
+        if (wearables != null)
+        {
+            foreach (var handle in wearables)
+            {
+                var wearable = handle.Value;
+                if (wearable is not { IsValid: true }) continue;
+
+                wearable.Render = Color.FromArgb(0, wearable.Render);
+                Utilities.SetStateChanged(wearable, "CBaseModelEntity", "m_clrRender");
+                wearable.ShadowStrength = 0f;
+                Utilities.SetStateChanged(wearable, "CBaseModelEntity", "m_flShadowStrength");
+                _hiddenEntities[wearable] = player.Slot;
+            }
+        }
+    }
+
+    /// <summary>恢复玩家及其武器/手套的可见性与影子。</summary>
+    private void RestoreVisibility(CCSPlayerController player)
+    {
+        int slot = player.Slot;
+
+        // 清理该玩家登记过的隐藏实体
+        var stale = _hiddenEntities.Where(kv => kv.Value == slot).Select(kv => kv.Key).ToList();
+        foreach (var entity in stale)
+            _hiddenEntities.Remove(entity);
+
+        var pawn = player.PlayerPawn?.Value;
+        if (pawn is not { IsValid: true }) return;
+
+        pawn.Render = Color.FromArgb(255, pawn.Render);
+        Utilities.SetStateChanged(pawn, "CBaseModelEntity", "m_clrRender");
+        pawn.ShadowStrength = 1f;
+        Utilities.SetStateChanged(pawn, "CBaseModelEntity", "m_flShadowStrength");
+        pawn.Flags &= ~FL_NOTARGET;
+        Utilities.SetStateChanged(pawn, "CBaseEntity", "m_fFlags");
+
+        var weapons = pawn.WeaponServices?.MyWeapons;
+        if (weapons != null)
+        {
+            foreach (var handle in weapons)
+            {
+                var weapon = handle.Value;
+                if (weapon is not { IsValid: true }) continue;
+
+                weapon.Render = Color.FromArgb(255, weapon.Render);
+                Utilities.SetStateChanged(weapon, "CBaseModelEntity", "m_clrRender");
+                weapon.ShadowStrength = 1f;
+                Utilities.SetStateChanged(weapon, "CBaseModelEntity", "m_flShadowStrength");
+            }
+        }
+
+        var wearables = pawn.MyWearables;
+        if (wearables != null)
+        {
+            foreach (var handle in wearables)
+            {
+                var wearable = handle.Value;
+                if (wearable is not { IsValid: true }) continue;
+
+                wearable.Render = Color.FromArgb(255, wearable.Render);
+                Utilities.SetStateChanged(wearable, "CBaseModelEntity", "m_clrRender");
+                wearable.ShadowStrength = 1f;
+                Utilities.SetStateChanged(wearable, "CBaseModelEntity", "m_flShadowStrength");
+            }
+        }
+    }
+
+    // ==================== 秒下包/秒拆弹（!fb / fb）====================
+    // 原理：拦截 bomb_beginplant / bomb_begindefuse 事件，
+    // 将 C4 下包耗时（ArmedTime）或拆弹倒计时（DefuseCountDown）归零，实现秒完成。
+    // 不区分阵营：CT 拿到 C4 后同样可以秒下包。
+
+    private void OnFastBombCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        int slot = player.Slot;
+        if (_fastBombPlayers.Remove(slot))
+            player.PrintToChat(" [FastBomb] 已关闭秒下包/秒拆弹");
+        else
+        {
+            _fastBombPlayers.Add(slot);
+            player.PrintToChat(" [FastBomb] 已开启秒下包/秒拆弹（0.1秒）");
+        }
+    }
+
+    private void OnFastBombConsoleCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        if (info.ArgCount < 2)
+        {
+            player.PrintToChat(" [FastBomb] 用法: fb 1 开启 / fb 0 关闭");
+            return;
+        }
+
+        int slot = player.Slot;
+        bool enable = !(int.TryParse(info.GetArg(1), out int val) && val == 0);
+        if (enable) _fastBombPlayers.Add(slot);
+        else _fastBombPlayers.Remove(slot);
+        player.PrintToChat(enable ? " [FastBomb] 已开启秒下包/秒拆弹" : " [FastBomb] 已关闭");
+    }
+
+    private HookResult OnBombBeginPlant(EventBombBeginplant @event, GameEventInfo info)
+    {
+        var player = @event.Userid;
+        if (player == null || !player.IsValid || !_fastBombPlayers.Contains(player.Slot))
+            return HookResult.Continue;
+
+        var bomb = Utilities.FindAllEntitiesByDesignerName<CC4>("weapon_c4").FirstOrDefault();
+        if (bomb is not { IsValid: true }) return HookResult.Continue;
+
+        bomb.BombPlacedAnimation = false;
+        bomb.ArmedTime = 0f;
+        return HookResult.Continue;
+    }
+
+    private HookResult OnBombBeginDefuse(EventBombBegindefuse @event, GameEventInfo info)
+    {
+        var player = @event.Userid;
+        if (player == null || !player.IsValid || !_fastBombPlayers.Contains(player.Slot))
+            return HookResult.Continue;
+
+        // 拆弹放到下一帧执行，避免在事件回调内直接操作 planted_c4 导致偶发崩溃
+        Server.NextFrame(() =>
+        {
+            var bomb = Utilities.FindAllEntitiesByDesignerName<CPlantedC4>("planted_c4").FirstOrDefault();
+            if (bomb is not { IsValid: true }) return;
+            bomb.DefuseCountDown = 0f;
+        });
+        return HookResult.Continue;
     }
 
     // ==================== 无限蹲起（!sc / sc）====================
@@ -521,6 +998,195 @@ public class XRayUnlockerPlugin : BasePlugin
         }
     }
 
+    // ==================== 魔法子弹（!mb / mb）====================
+    // 原理：拦截 EventWeaponFire，在 ±10° 锥形内找最近敌人。
+    // 非致死：直接扣血（引擎自动同步血量）。
+    // 致死：记录击杀信息到 _pendingMagicBulletKills → CommitSuicide 让引擎走完整死亡流程
+    // → EventPlayerDeath Pre-hook 反射修正击杀者为真实攻击者（非自杀）。
+    // 暗金计数 OnPlayerDeathPost 在 Pre-hook 之后执行，读取到的已是修正后的 attacker。
+
+    /// <summary>待修正的魔法子弹击杀：victimPawn.Index → (attackerSlot, weaponDesignerName, headshot)</summary>
+    private readonly Dictionary<uint, (int AttackerSlot, string Weapon, bool Headshot)> _pendingMagicBulletKills = new();
+
+    /// <summary>武器 DesignerName → 身体伤害（爆头 = 身体 × 4）</summary>
+    private static readonly Dictionary<string, int> WeaponDamages = new()
+    {
+        {"weapon_ak47", 36}, {"weapon_m4a1", 33}, {"weapon_m4a1_silencer", 33},
+        {"weapon_aug", 33}, {"weapon_sg556", 36}, {"weapon_galilar", 33}, {"weapon_famas", 33},
+        {"weapon_awp", 115}, {"weapon_ssg08", 88}, {"weapon_scar20", 80}, {"weapon_g3sg1", 80},
+        {"weapon_deagle", 53}, {"weapon_revolver", 115}, {"weapon_elite", 42},
+        {"weapon_fiveseven", 36}, {"weapon_p250", 35}, {"weapon_usp_silencer", 35},
+        {"weapon_glock", 30}, {"weapon_hkp2000", 35}, {"weapon_cz75a", 31}, {"weapon_tec9", 33},
+        {"weapon_mp9", 29}, {"weapon_mac10", 26}, {"weapon_mp7", 26},
+        {"weapon_mp5sd", 26}, {"weapon_ump45", 35}, {"weapon_p90", 26}, {"weapon_bizon", 26},
+        {"weapon_nova", 26}, {"weapon_xm1014", 20}, {"weapon_mag7", 30}, {"weapon_sawedoff", 32},
+        {"weapon_m249", 36}, {"weapon_negev", 35},
+    };
+
+    private void OnMagicBulletCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        int slot = player.Slot;
+
+        if (_magicBulletPlayers.Contains(slot))
+        {
+            _magicBulletPlayers.Remove(slot);
+            player.PrintToChat(" [MagicBullet] 魔法子弹已关闭");
+        }
+        else
+        {
+            _magicBulletPlayers.Add(slot);
+            player.PrintToChat(" [MagicBullet] 魔法子弹已开启 - 瞄准大致方向自动命中最近敌人");
+        }
+    }
+
+    private void OnMagicBulletConsoleCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        int slot = player.Slot;
+
+        if (info.ArgCount < 2)
+        {
+            player.PrintToChat(" [MagicBullet] 用法: mb 1 开启 / mb 0 关闭");
+            return;
+        }
+
+        if (int.TryParse(info.GetArg(1), out int val) && val == 0)
+        {
+            _magicBulletPlayers.Remove(slot);
+            player.PrintToChat(" [MagicBullet] 魔法子弹已关闭");
+        }
+        else
+        {
+            _magicBulletPlayers.Add(slot);
+            player.PrintToChat(" [MagicBullet] 魔法子弹已开启 - 瞄准大致方向自动命中最近敌人");
+        }
+    }
+
+    /// <summary>
+    /// EventPlayerDeath Pre-hook：修正魔法子弹击杀的死亡事件，
+    /// 将自杀（CommitSuicide）改为正确的攻击者/武器/爆头信息。
+    /// </summary>
+    private HookResult OnPlayerDeathMagicFix(EventPlayerDeath @event, GameEventInfo info)
+    {
+        var victim = @event.Userid;
+        if (victim == null || !victim.IsValid) return HookResult.Continue;
+
+        var victimPawn = victim.PlayerPawn?.Value;
+        if (victimPawn == null || !victimPawn.IsValid) return HookResult.Continue;
+
+        if (!_pendingMagicBulletKills.TryGetValue(victimPawn.Index, out var killInfo))
+            return HookResult.Continue;
+
+        _pendingMagicBulletKills.Remove(victimPawn.Index);
+
+        // 修正死亡事件中的击杀者（SetInt 是 protected，用反射调用）
+        var attacker = Utilities.GetPlayerFromSlot(killInfo.AttackerSlot);
+        if (attacker != null)
+        {
+            var setIntMethod = typeof(EventPlayerDeath).BaseType!.GetMethod("SetInt",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            setIntMethod?.Invoke(@event, new object[] { "attacker", (int)attacker.UserId! });
+        }
+
+        @event.Weapon = killInfo.Weapon;
+        @event.Headshot = killInfo.Headshot;
+
+        return HookResult.Continue;
+    }
+
+    private HookResult OnWeaponFireMagicBullet(EventWeaponFire @event, GameEventInfo info)
+    {
+        var player = @event.Userid;
+        if (player == null || !player.IsValid) return HookResult.Continue;
+        if (!_magicBulletPlayers.Contains(player.Slot)) return HookResult.Continue;
+
+        var pawn = player.PlayerPawn?.Value;
+        if (pawn == null || !pawn.IsValid) return HookResult.Continue;
+
+        // 获取玩家眼睛位置和瞄准方向
+        var eyePos = pawn.CBodyComponent?.SceneNode?.AbsOrigin;
+        if (eyePos == null) return HookResult.Continue;
+
+        var eyeAngles = pawn.EyeAngles;
+        float pitch = (float)(eyeAngles.X * Math.PI / 180.0);
+        float yaw   = (float)(eyeAngles.Y * Math.PI / 180.0);
+        var aimDir = new Vector(
+            (float)(Math.Cos(pitch) * Math.Cos(yaw)),
+            (float)(Math.Cos(pitch) * Math.Sin(yaw)),
+            (float)(-Math.Sin(pitch))
+        );
+
+        // 在 ±10° 锥形内找最近的活敌人
+        const float maxAngle = 10f;
+        CCSPlayerController? bestTarget = null;
+        float bestAngle = maxAngle + 1f;
+
+        foreach (var target in Utilities.GetPlayers())
+        {
+            if (target == null || !target.IsValid) continue;
+            if (target == player) continue;
+            if (target.Team == player.Team) continue;
+
+            var targetPawn = target.PlayerPawn?.Value;
+            if (targetPawn is not { IsValid: true, Health: > 0 }) continue;
+
+            var targetPos = targetPawn.CBodyComponent?.SceneNode?.AbsOrigin;
+            if (targetPos == null) continue;
+
+            float dx = targetPos.X - eyePos.X;
+            float dy = targetPos.Y - eyePos.Y;
+            float dz = targetPos.Z - eyePos.Z;
+            float dist = (float)Math.Sqrt(dx * dx + dy * dy + dz * dz);
+            if (dist < 0.01f) continue;
+
+            var toTarget = new Vector(dx / dist, dy / dist, dz / dist);
+            float dot = aimDir.X * toTarget.X + aimDir.Y * toTarget.Y + aimDir.Z * toTarget.Z;
+            float angle = (float)(Math.Acos(Math.Clamp(dot, -1.0, 1.0)) * 180.0 / Math.PI);
+
+            if (angle < bestAngle)
+            {
+                bestAngle = angle;
+                bestTarget = target;
+            }
+        }
+
+        if (bestTarget == null) return HookResult.Continue;
+
+        var bestPawn = bestTarget.PlayerPawn?.Value;
+        if (bestPawn == null || !bestPawn.IsValid) return HookResult.Continue;
+
+        // 随机头部（65%）或身体（35%）
+        bool headshot = Random.Shared.Next(100) < 65;
+
+        // 查武器伤害
+        string rawWeapon = @event.Weapon;
+        string designerName = rawWeapon.StartsWith("weapon_") ? rawWeapon : "weapon_" + rawWeapon;
+        if (!WeaponDamages.TryGetValue(designerName, out int bodyDmg))
+            bodyDmg = 30;
+        int damage = headshot ? bodyDmg * 4 : bodyDmg;
+
+        int newHealth = Math.Max(0, bestPawn.Health - damage);
+
+        if (newHealth <= 0)
+        {
+            // 致死：记录待修正信息，走 CommitSuicide 触发完整死亡流程
+            _pendingMagicBulletKills[bestPawn.Index] = (player.Slot, designerName, headshot);
+            bestPawn.Health = 0;
+            Utilities.SetStateChanged(bestPawn, "CBaseEntity", "m_iHealth");
+            bestPawn.CommitSuicide(false, true);
+            // OnPlayerDeathMagicFix（Pre-hook）会在死亡事件触发前修正 attacker
+        }
+        else
+        {
+            // 非致死：直接扣血，引擎自动同步血量显示
+            bestPawn.Health = newHealth;
+            Utilities.SetStateChanged(bestPawn, "CBaseEntity", "m_iHealth");
+        }
+
+        return HookResult.Continue;
+    }
+
     // ==================== 暗金计数器 ====================
 
     private void OnStatTrakCommand(CCSPlayerController? player, CommandInfo info)
@@ -572,26 +1238,22 @@ public class XRayUnlockerPlugin : BasePlugin
 
         int slot = player.Slot;
         string designerName = weapon.DesignerName;
-        uint entityIndex = weapon.Index;
 
-        // 写入存储，绑定当前武器实体（用户的"自己的枪"）
+        // 合并武器真实暗金值，确保设定值不小于武器已有真实值
+        int realValue = weapon.FallbackStatTrak >= 0 ? weapon.FallbackStatTrak : 0;
+        int mergedValue = Math.Max(value, realValue);
+
         if (!_statTrakValues.TryGetValue(slot, out var typeDict))
         {
-            typeDict = new Dictionary<string, (uint, int)>();
+            typeDict = new Dictionary<string, int>();
             _statTrakValues[slot] = typeDict;
         }
-        typeDict[designerName] = (entityIndex, value);
+        typeDict[designerName] = mergedValue;
 
-        // !st 命令即认领，标记为本回合购买（最高优先级）
-        if (!_purchasedThisRound.TryGetValue(slot, out var purchasedSet))
-        {
-            purchasedSet = new HashSet<string>();
-            _purchasedThisRound[slot] = purchasedSet;
-        }
-        purchasedSet.Add(designerName);
-
-        ApplyStatTrakValue(weapon, value);
-        player.PrintToChat($" [StatTrak] 暗金计数已修改为: {value} (击杀会在设定值上递增)");
+        ApplyStatTrakValue(weapon, mergedValue);
+        player.PrintToChat(mergedValue != value
+            ? $" [StatTrak] 暗金计数已修改为: {mergedValue} (真实值 {realValue} 更高，已自动合并)"
+            : $" [StatTrak] 暗金计数已修改为: {value} (击杀会在设定值上递增)");
     }
 
     /// <summary>
@@ -642,49 +1304,9 @@ public class XRayUnlockerPlugin : BasePlugin
     }
 
     /// <summary>
-    /// 检查玩家背包中是否仍持有指定实体索引的武器。
-    /// 用于判断旧绑定实体是否已被销毁/丢弃。
-    /// </summary>
-    private static bool PlayerHasWeaponEntity(CCSPlayerController player, uint entityIndex)
-    {
-        var weapons = player.PlayerPawn?.Value?.WeaponServices?.MyWeapons;
-        if (weapons == null) return false;
-        foreach (var w in weapons)
-        {
-            if (w?.Value?.Index == entityIndex)
-                return true;
-        }
-        return false;
-    }
-
-    /// <summary>
-    /// 购买事件：记录玩家本回合购买的武器型号。
-    /// 购买 = 一定属于自己，后续绑定跳过所有歧义检查。
-    /// </summary>
-    private HookResult OnItemPurchase(EventItemPurchase @event, GameEventInfo info)
-    {
-        var player = @event.Userid;
-        if (player == null || !player.IsValid) return HookResult.Continue;
-
-        string rawWeapon = @event.Weapon;
-        if (string.IsNullOrEmpty(rawWeapon)) return HookResult.Continue;
-
-        int slot = player.Slot;
-        string designerName = rawWeapon.StartsWith("weapon_") ? rawWeapon : "weapon_" + rawWeapon;
-
-        if (!_purchasedThisRound.TryGetValue(slot, out var set))
-        {
-            set = new HashSet<string>();
-            _purchasedThisRound[slot] = set;
-        }
-        set.Add(designerName);
-
-        return HookResult.Continue;
-    }
-
-    /// <summary>
-    /// 武器实体创建事件：捕获 buy / give 等所有途径获取的武器
-    /// 只记录玩家有关心值（_statTrakValues 中有该型号）的武器，不依赖武器自身是否暗金
+    /// 武器实体创建事件：捕获 buy / give 等所有途径获取的武器。
+    /// 若玩家对该武器类型设过 ST 值，合并 max(存储值, 武器真实暗金值) 后写入。
+    /// 防止换武器后存储值低于真实击杀数导致"倒回"。
     /// </summary>
     private void OnWeaponEntityCreated(CEntityInstance entity)
     {
@@ -696,63 +1318,28 @@ public class XRayUnlockerPlugin : BasePlugin
         int slot = player.Slot;
         string designerName = weapon.DesignerName;
 
-        // 只记录玩家有 ST 值的武器类型（不关心没设过的枪）
         if (!_statTrakValues.TryGetValue(slot, out var typeDict)
-            || !typeDict.ContainsKey(designerName))
+            || !typeDict.TryGetValue(designerName, out int storedValue))
             return;
 
-        if (!_purchasedThisRound.TryGetValue(slot, out var set))
-        {
-            set = new HashSet<string>();
-            _purchasedThisRound[slot] = set;
-        }
-        set.Add(designerName);
+        // 合并武器真实暗金值（InvSim 写入的），确保存储值不会低于真实值
+        int realValue = weapon.FallbackStatTrak >= 0 ? weapon.FallbackStatTrak : 0;
+        int mergedValue = Math.Max(storedValue, realValue);
+        if (mergedValue != storedValue)
+            typeDict[designerName] = mergedValue;
 
-        // 立即绑定并写值，不等 OnTick，防止切后台时 OnTick 迟迟不触发导致显示真实击杀值
-        var entry = typeDict[designerName];
-        typeDict[designerName] = (weapon.Index, entry.Value);
-
-        // 穿墙功能：新武器入手时立即修改穿透属性，不等下一帧 OnTick
+        // 穿墙功能：新武器入手时立即修改穿透属性
         ApplyWeaponPenFeatures(player, weapon);
 
-        // 如果武器已经是暗金（InvSim 已套皮），立即写值覆盖真实击杀数
+        // 暗金武器立即写值覆盖真实击杀数
         if (WeaponHasStatTrak(weapon))
-            ApplyStatTrakValue(weapon, entry.Value);
+            ApplyStatTrakValue(weapon, mergedValue);
     }
 
     /// <summary>
-    /// 判断是否应该认领当前武器为自己的枪。
-    /// 优先级：1) 本回合购买过 / !st 设置过 → 一定属于自己
-    ///         2) EntityIndex 匹配 → 已绑定，无需认领
-    ///         3) EntityIndex==0 且武器已带有我们的暗金值 → 从上回合保留
-    ///         其余情况 → 不认领（歧义，可能是别人的枪）
-    /// </summary>
-    private bool ShouldClaimWeapon(CCSPlayerController player, CBasePlayerWeapon weapon, uint boundEntityIndex, string designerName, int storedValue)
-    {
-        int slot = player.Slot;
-
-        // 本回合购买过 / !st 设置过 → 一定属于自己
-        if (_purchasedThisRound.TryGetValue(slot, out var purchasedSet)
-            && purchasedSet.Contains(designerName))
-        {
-            purchasedSet.Remove(designerName); // 消费掉，避免重复认领
-            return true;
-        }
-
-        // 已绑定且匹配
-        if (boundEntityIndex != 0 && boundEntityIndex == weapon.Index)
-            return true;
-
-        // 未绑定 + 武器已带有我们的暗金指纹 → 从上回合保留的自己的枪
-        if (boundEntityIndex == 0 && weapon.FallbackStatTrak == storedValue)
-            return true;
-
-        return false;
-    }
-
-    /// <summary>
-    /// PostHook：从事件获取击杀武器名，检查实体是否为自己绑定的枪。
-    /// 捡来的枪杀了人不递增，只有"自己的枪"才递增。
+    /// PostHook：玩家击杀时，若攻击者对击杀武器类型设过 ST 值，始终递增并持久化。
+    /// 不再检查 WeaponHasStatTrak —— 换武器后 InvSim 可能短暂重置暗金状态导致误判。
+    /// ApplyStatTrakValue 内部已用 null-conditional 安全处理非暗金武器。
     /// </summary>
     private HookResult OnPlayerDeathPost(EventPlayerDeath @event, GameEventInfo info)
     {
@@ -767,7 +1354,12 @@ public class XRayUnlockerPlugin : BasePlugin
         if (string.IsNullOrEmpty(evWeapon)) return HookResult.Continue;
         string designerName = evWeapon.StartsWith("weapon_") ? evWeapon : "weapon_" + evWeapon;
 
-        // 从物品栏找到真正造成击杀的武器实体（而不是当前手持武器，防止切枪后错判）
+        // 玩家对该武器类型设过 ST 值才递增
+        if (!_statTrakValues.TryGetValue(slot, out var typeDict)
+            || !typeDict.TryGetValue(designerName, out int currentValue))
+            return HookResult.Continue;
+
+        // 从物品栏找到真正造成击杀的武器实体，写入新值
         var weapons = attacker.PlayerPawn?.Value?.WeaponServices?.MyWeapons;
         CBasePlayerWeapon? killWeapon = null;
         if (weapons != null)
@@ -786,29 +1378,8 @@ public class XRayUnlockerPlugin : BasePlugin
         if (killWeapon == null)
             return HookResult.Continue;
 
-        // 武器是暗金枪才计数
-        if (!WeaponHasStatTrak(killWeapon))
-            return HookResult.Continue;
-
-        // 若玩家从未用 !st 设定过该武器的值，自动以武器当前击杀数为基准初始化
-        if (!_statTrakValues.TryGetValue(slot, out var typeDict))
-        {
-            typeDict = new Dictionary<string, (uint, int)>();
-            _statTrakValues[slot] = typeDict;
-        }
-        if (!typeDict.TryGetValue(designerName, out var entry))
-        {
-            int baseValue = killWeapon.FallbackStatTrak >= 0 ? killWeapon.FallbackStatTrak : 0;
-            entry = (0, baseValue);
-            typeDict[designerName] = entry;
-        }
-
-        // 多条件综合判断：这枪属于自己吗？
-        if (!ShouldClaimWeapon(attacker, killWeapon, entry.EntityIndex, designerName, entry.Value))
-            return HookResult.Continue;
-
-        int newValue = entry.Value + 1;
-        typeDict[designerName] = (killWeapon.Index, newValue);
+        int newValue = currentValue + 1;
+        typeDict[designerName] = newValue;
         ApplyStatTrakValue(killWeapon, newValue);
 
         // JSON 持久化记录
@@ -830,6 +1401,8 @@ public class XRayUnlockerPlugin : BasePlugin
             RegisterPawnMapping(player);
             if (_godPlayers.Contains(slot))
                 SetupGodMode(player);
+            if (_invisiblePlayers.Contains(slot))
+                ApplyInvisibility(player);
         });
         return HookResult.Continue;
     }
@@ -853,22 +1426,12 @@ public class XRayUnlockerPlugin : BasePlugin
     {
         ApplyAllLimits();
 
-        // 新回合开始，重置所有暗金实体绑定（玩家会买新枪，旧 EntityIndex 失效）
-        foreach (var typeDict in _statTrakValues.Values)
-        {
-            var keys = typeDict.Keys.ToList();
-            foreach (var key in keys)
-            {
-                var entry = typeDict[key];
-                typeDict[key] = (0, entry.Value); // 保留值，清空实体绑定
-            }
-        }
-
-        // 清空本回合购买记录
-        _purchasedThisRound.Clear();
-
         // 新回合所有武器重置，清空穿透修改备份
         _weaponOrigValues.Clear();
+
+        // 清空掉落物和C4的glow
+        DestroyAllDropGlows();
+        DestroyC4Glow();
 
         // 多级重试兜底：pawn、CBodyComponent、SceneNode 都可能在换局后延迟就绪
         AddTimer(0.2f, () => RebuildAllPlayerStates());
@@ -967,9 +1530,13 @@ public class XRayUnlockerPlugin : BasePlugin
         bool hasStatTrak = _statTrakValues.Count > 0;
         bool hasNoFlash = _noFlashPlayers.Count > 0;
         bool hasStamina = _noStaminaPlayers.Count > 0;
-        if (!hasGod && !hasXray && !hasStatTrak && !hasNoFlash && !hasStamina && !hasWallPen && !hasNoWallDmg && !hasOrphanedWeapons && !hasCounterStrafe) return;
+        bool hasInvisible = _invisiblePlayers.Count > 0;
+        if (!hasGod && !hasXray && !hasStatTrak && !hasNoFlash && !hasStamina && !hasWallPen && !hasNoWallDmg && !hasOrphanedWeapons && !hasCounterStrafe && !hasInvisible) return;
 
         _tickCounter++;
+
+        // 隐身：每帧重建隐藏实体集合，避免残留失效实体（换武器/换局后自动清理）
+        if (hasInvisible) _hiddenEntities.Clear();
 
         foreach (var player in Utilities.GetPlayers())
         {
@@ -1027,25 +1594,16 @@ public class XRayUnlockerPlugin : BasePlugin
                 }
             }
 
-            // 暗金覆盖与绑定：
-            // 只对自己绑定的武器写值，不污染别人的枪
+            // 暗金覆盖：玩家对某武器类型设过值 → 每帧强制写回
             if (hasStatTrak && _statTrakValues.TryGetValue(slot, out var typeDict))
             {
                 var weapon = player.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value;
                 if (weapon is { IsValid: true } && WeaponHasStatTrak(weapon))
                 {
                     string designerName = weapon.DesignerName;
-                    if (typeDict.TryGetValue(designerName, out var entry))
+                    if (typeDict.TryGetValue(designerName, out int storedValue))
                     {
-                        // 尝试认领（购买记录 / 已绑定 / 暗金指纹匹配）
-                        if (ShouldClaimWeapon(player, weapon, entry.EntityIndex, designerName, entry.Value))
-                        {
-                            // 认领成功 → 绑定 + 写值
-                            if (entry.EntityIndex != weapon.Index)
-                                typeDict[designerName] = (weapon.Index, entry.Value);
-                            ApplyStatTrakValue(weapon, entry.Value);
-                        }
-                        // 未认领 → 不写值（不污染别人的枪）
+                        ApplyStatTrakValue(weapon, storedValue);
                     }
                 }
             }
@@ -1085,6 +1643,24 @@ public class XRayUnlockerPlugin : BasePlugin
                     }
                 }
             }
+
+            // 隐身：每帧重新应用，保证换武器/换局后依旧不可见
+            if (hasInvisible && _invisiblePlayers.Contains(slot))
+                ApplyInvisibility(player);
+        }
+
+        // ===== 掉落物透视：每 32 帧扫描更新 =====
+        if (_dropXrayUsers.Count > 0 && _tickCounter % 32 == 0)
+            UpdateDropGlows();
+
+        // ===== C4透视闪烁 =====
+        if (_c4GlowPair is { } c4p && c4p.glow is { IsValid: true } && _c4XrayUsers.Count > 0)
+        {
+            _c4FlashTick++;
+            if (_c4FlashTick % 8 == 0)
+                c4p.glow.Render = c4p.glow.Render.A == 1
+                    ? Color.FromArgb(255, 255, 255, 255)
+                    : Color.FromArgb(1, 255, 255, 255);
         }
     }
 
@@ -1131,6 +1707,14 @@ public class XRayUnlockerPlugin : BasePlugin
         {
             if (player == null || !player.IsValid) continue;
 
+            // 隐身：阻止其他玩家（含 BOT）接收隐身玩家的实体（模型 + 所有武器）
+            foreach (var (entity, ownerSlot) in _hiddenEntities)
+            {
+                if (!entity.IsValid) continue;
+                if (ownerSlot != player.Slot)
+                    info.TransmitEntities.Remove(entity);
+            }
+
             bool isXrayUser = _xrayUsers.Contains(player.Slot);
 
             foreach (var (slot, (relay, glow)) in _playerGlows)
@@ -1148,6 +1732,39 @@ public class XRayUnlockerPlugin : BasePlugin
                 {
                     info.TransmitEntities.Remove(relay);
                     info.TransmitEntities.Remove(glow);
+                }
+            }
+
+            // 掉落物透视
+            bool isDropXrayUser = _dropXrayUsers.Contains(player.Slot);
+            foreach (var pair in _dropGlows.Values)
+            {
+                if (pair.glow is not { IsValid: true }) continue;
+                if (isDropXrayUser)
+                {
+                    info.TransmitEntities.Add(pair.relay);
+                    info.TransmitEntities.Add(pair.glow);
+                }
+                else
+                {
+                    info.TransmitEntities.Remove(pair.relay);
+                    info.TransmitEntities.Remove(pair.glow);
+                }
+            }
+
+            // C4透视
+            bool isC4XrayUser = _c4XrayUsers.Contains(player.Slot);
+            if (_c4GlowPair is { } c4p && c4p.glow is { IsValid: true })
+            {
+                if (isC4XrayUser)
+                {
+                    info.TransmitEntities.Add(c4p.relay);
+                    info.TransmitEntities.Add(c4p.glow);
+                }
+                else
+                {
+                    info.TransmitEntities.Remove(c4p.relay);
+                    info.TransmitEntities.Remove(c4p.glow);
                 }
             }
         }

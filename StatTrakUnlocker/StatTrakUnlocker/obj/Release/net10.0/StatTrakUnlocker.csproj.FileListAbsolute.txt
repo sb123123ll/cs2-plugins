@@ -1,0 +1,5 @@
+G:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\cs2-plugins\StatTrakUnlocker\StatTrakUnlocker\obj\Release\net10.0\StatTrakUnlocker.GeneratedMSBuildEditorConfig.editorconfig
+G:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\cs2-plugins\StatTrakUnlocker\StatTrakUnlocker\obj\Release\net10.0\StatTrakUnlocker.AssemblyInfoInputs.cache
+G:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\cs2-plugins\StatTrakUnlocker\StatTrakUnlocker\obj\Release\net10.0\StatTrakUnlocker.AssemblyInfo.cs
+G:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\cs2-plugins\StatTrakUnlocker\StatTrakUnlocker\obj\Release\net10.0\StatTrakUnlocker.csproj.CoreCompileInputs.cache
+G:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\cs2-plugins\StatTrakUnlocker\StatTrakUnlocker\obj\Release\net10.0\StatTrakUnlocker.sourcelink.json
