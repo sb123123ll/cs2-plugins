@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CS2 饰品可视化配置生成器</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #1e1e24;
+            color: #e0e0e0;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+        }
+        .container {
+            background-color: #2d2d30;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            max-width: 800px;
+            width: 100%;
+        }
+        h1 {
+            text-align: center;
+            color: #4da6ff;
+            border-bottom: 2px solid #4da6ff;
+            padding-bottom: 10px;
+        }
+        .section {
+            margin-bottom: 25px;
+            padding: 15px;
+            background-color: #3a3a3c;
+            border-radius: 8px;
+        }
+        .section h2 {
+            margin-top: 0;
+            color: #ffcc00;
+            font-size: 1.2em;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input[type="number"], input[type="text"], select {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #555;
+            border-radius: 4px;
+            background-color: #252526;
+            color: #fff;
+            box-sizing: border-box;
+        }
+        .btn {
+            background-color: #007acc;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 1em;
+            transition: background-color 0.3s;
+        }
+        .btn:hover {
+            background-color: #005999;
+        }
+        .result {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #1e1e1e;
+            border-left: 4px solid #4da6ff;
+            font-family: monospace;
+            word-break: break-all;
+        }
+        .copy-btn {
+            margin-top: 10px;
+            background-color: #28a745;
+        }
+        .copy-btn:hover {
+            background-color: #218838;
+        }
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+        }
+        .grid-3 {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 15px;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>CS2 饰品可视化配置生成器</h1>
+    <p style="text-align: center; color: #aaa;">生成控制台指令，直接在游戏中粘贴执行</p>
+
+    <!-- C4 挂件配置 -->
+    <div class="section">
+        <h2>💣 C4 挂件配置</h2>
+        <div class="form-group">
+            <label>挂件类型</label>
+            <select id="c4-type" onchange="toggleC4Type()">
+                <option value="normal">普通挂件</option>
+                <option value="sticker">封装印花挂件</option>
+            </select>
+        </div>
+        
+        <div class="grid-2">
+            <div class="form-group">
+                <label>挂件 ID (Def Index)</label>
+                <input type="number" id="c4-def" value="10001" placeholder="例如: 10001">
+            </div>
+            <div class="form-group" id="c4-sticker-group" style="display: none;">
+                <label>印花 ID (Sticker Def)</label>
+                <input type="number" id="c4-sticker" value="1" placeholder="例如: 1">
+            </div>
+            <div class="form-group">
+                <label>图案模板 (Seed)</label>
+                <input type="number" id="c4-seed" value="0" placeholder="默认: 0">
+            </div>
+        </div>
+
+        <label>坐标偏移 (X, Y, Z)</label>
+        <div class="grid-3">
+            <div class="form-group">
+                <input type="number" id="c4-x" value="0" step="0.1" placeholder="X">
+            </div>
+            <div class="form-group">
+                <input type="number" id="c4-y" value="0" step="0.1" placeholder="Y">
+            </div>
+            <div class="form-group">
+                <input type="number" id="c4-z" value="0" step="0.1" placeholder="Z">
+            </div>
+        </div>
+        
+        <button class="btn" onclick="generateC4Command()">生成 C4 挂件指令</button>
+    </div>
+
+    <!-- 暗金计数器配置 -->
+    <div class="section">
+        <h2>🔪 暗金计数器 (StatTrak) 配置</h2>
+        <p style="font-size: 0.9em; color: #aaa;">注意：现在原皮武器也支持暗金计数器了！</p>
+        <div class="form-group">
+            <label>初始击杀数</label>
+            <input type="number" id="st-value" value="1337" min="0" placeholder="输入你想要的击杀数">
+        </div>
+        <button class="btn" onclick="generateSTCommand()">生成暗金指令</button>
+    </div>
+
+    <!-- 结果展示区 -->
+    <div class="section" id="result-section" style="display: none;">
+        <h2>📋 生成的指令</h2>
+        <p>请在游戏控制台中粘贴以下指令：</p>
+        <div class="result" id="command-result"></div>
+        <button class="btn copy-btn" onclick="copyCommand()">复制指令</button>
+    </div>
+</div>
+
+<script>
+    function toggleC4Type() {
+        const type = document.getElementById('c4-type').value;
+        const stickerGroup = document.getElementById('c4-sticker-group');
+        if (type === 'sticker') {
+            stickerGroup.style.display = 'block';
+        } else {
+            stickerGroup.style.display = 'none';
+        }
+    }
+
+    function showResult(command) {
+        document.getElementById('command-result').innerText = command;
+        document.getElementById('result-section').style.display = 'block';
+    }
+
+    function generateC4Command() {
+        const type = document.getElementById('c4-type').value;
+        const def = document.getElementById('c4-def').value || 0;
+        const seed = document.getElementById('c4-seed').value || 0;
+        const x = document.getElementById('c4-x').value || 0;
+        const y = document.getElementById('c4-y').value || 0;
+        const z = document.getElementById('c4-z').value || 0;
+
+        let command = '';
+        if (type === 'sticker') {
+            const sticker = document.getElementById('c4-sticker').value || 1;
+            command = `css_c4charm sticker ${sticker} ${def} ${x} ${y} ${z} ${seed}`;
+        } else {
+            command = `css_c4charm ${def} ${x} ${y} ${z} ${seed}`;
+        }
+        
+        showResult(command);
+    }
+
+    function generateSTCommand() {
+        const value = document.getElementById('st-value').value || 0;
+        const command = `css_st ${value}`;
+        showResult(command);
+    }
+
+    function copyCommand() {
+        const text = document.getElementById('command-result').innerText;
+        navigator.clipboard.writeText(text).then(() => {
+            const btn = document.querySelector('.copy-btn');
+            const originalText = btn.innerText;
+            btn.innerText = '已复制！';
+            btn.style.backgroundColor = '#20c997';
+            setTimeout(() => {
+                btn.innerText = originalText;
+                btn.style.backgroundColor = '#28a745';
+            }, 2000);
+        });
+    }
+</script>
+
+</body>
+</html>

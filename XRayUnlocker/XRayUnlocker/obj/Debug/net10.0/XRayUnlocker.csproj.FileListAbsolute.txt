@@ -1,0 +1,13 @@
+G:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\cs2-plugins\XRayUnlocker\XRayUnlocker\bin\Debug\net10.0\XRayUnlocker.deps.json
+G:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\cs2-plugins\XRayUnlocker\XRayUnlocker\bin\Debug\net10.0\XRayUnlocker.dll
+G:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\cs2-plugins\XRayUnlocker\XRayUnlocker\bin\Debug\net10.0\XRayUnlocker.pdb
+G:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\cs2-plugins\XRayUnlocker\XRayUnlocker\obj\Debug\net10.0\XRayUnlocker.csproj.AssemblyReference.cache
+G:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\cs2-plugins\XRayUnlocker\XRayUnlocker\obj\Debug\net10.0\XRayUnlocker.GeneratedMSBuildEditorConfig.editorconfig
+G:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\cs2-plugins\XRayUnlocker\XRayUnlocker\obj\Debug\net10.0\XRayUnlocker.AssemblyInfoInputs.cache
+G:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\cs2-plugins\XRayUnlocker\XRayUnlocker\obj\Debug\net10.0\XRayUnlocker.AssemblyInfo.cs
+G:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\cs2-plugins\XRayUnlocker\XRayUnlocker\obj\Debug\net10.0\XRayUnlocker.csproj.CoreCompileInputs.cache
+G:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\cs2-plugins\XRayUnlocker\XRayUnlocker\obj\Debug\net10.0\XRayUnlocker.sourcelink.json
+G:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\cs2-plugins\XRayUnlocker\XRayUnlocker\obj\Debug\net10.0\XRayUnlocker.dll
+G:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\cs2-plugins\XRayUnlocker\XRayUnlocker\obj\Debug\net10.0\refint\XRayUnlocker.dll
+G:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\cs2-plugins\XRayUnlocker\XRayUnlocker\obj\Debug\net10.0\XRayUnlocker.pdb
+G:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\cs2-plugins\XRayUnlocker\XRayUnlocker\obj\Debug\net10.0\ref\XRayUnlocker.dll

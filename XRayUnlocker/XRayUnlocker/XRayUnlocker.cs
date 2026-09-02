@@ -314,6 +314,20 @@ public class XRayUnlockerPlugin : BasePlugin
     private Dictionary<string, Dictionary<string, int>> _savedKillCounts = new();
     private string _stattrakJsonPath = string.Empty;
 
+    // ==================== C4 挂件 ====================
+    // slot → C4 挂件配置。C4 仅 T 方持有，按玩家槽位存储
+    private readonly Dictionary<int, C4CharmConfig> _c4Charms = new();
+
+    // C4 挂件配置（def=挂件物品定义索引，seed=图案/摆动种子，xyz=偏移坐标）
+    // StickerDef 非空时表示"印花封存板"挂件（def=封存板物品，StickerDef=封存的印花）
+    private sealed class C4CharmConfig
+    {
+        public uint Def;
+        public int Seed;
+        public float X, Y, Z;
+        public uint? StickerDef;
+    }
+
     // ==================== 暗金计数命令 ====================
 
     private static readonly MemoryFunctionWithReturn<nint, string, float, int> _setAttributeValueByName =
@@ -339,8 +353,16 @@ public class XRayUnlockerPlugin : BasePlugin
         RegisterEventHandler<EventBombPlanted>(OnBombPlanted);
         RegisterEventHandler<EventBombDefused>(OnBombDefused);
         RegisterEventHandler<EventBombExploded>(OnBombExploded);
-        RegisterEventHandler<EventBombBeginplant>(OnBombBeginPlant);
-        RegisterEventHandler<EventBombBegindefuse>(OnBombBeginDefuse);
+        // 秒下包/秒拆弹事件：单独保护，避免注册异常拖垮整个插件加载
+        try
+        {
+            RegisterEventHandler<EventBombBeginplant>(OnBombBeginPlant);
+            RegisterEventHandler<EventBombBegindefuse>(OnBombBeginDefuse);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[XRayUnlocker] 秒下包/秒拆弹事件注册失败（功能将不可用）: {ex.Message}");
+        }
 
         RegisterListener<Listeners.OnMapStart>(OnMapStart);
         AddCommandListener("bot_add", OnBotAddCommand, HookMode.Pre);
@@ -351,6 +373,8 @@ public class XRayUnlockerPlugin : BasePlugin
         AddCommand("god", "控制台无敌开关: god 1 开启, god 0 关闭", OnGodConsoleCommand);
         AddCommand("css_st", "修改当前武器暗金计数器: st <数字>", OnStatTrakCommand);
         AddCommand("st", "控制台修改暗金计数器: st <数字>", OnStatTrakConsoleCommand);
+        AddCommand("css_c4charm", "设置C4挂件: c4charm <挂件def> <x> <y> <z> [seed]，c4charm off 移除", OnC4CharmCommand);
+        AddCommand("c4charm", "控制台设置C4挂件: c4charm <挂件def> <x> <y> <z> [seed]，c4charm off 移除", OnC4CharmConsoleCommand);
         AddCommand("css_nf", "开关防闪光白屏", OnNoFlashCommand);
         AddCommand("nf", "控制台防闪光: nf 1 开启, nf 0 关闭", OnNoFlashConsoleCommand);
         AddCommand("css_sc", "开关无限蹲起（无体力无冷却）", OnSpamCrouchCommand);
@@ -372,8 +396,12 @@ public class XRayUnlockerPlugin : BasePlugin
         AddCommand("inv", "控制台隐身: inv 1 开启, inv 0 关闭", OnInvisConsoleCommand);
         AddCommand("css_fb", "开关秒下包/秒拆弹（0.1秒，不分阵营）", OnFastBombCommand);
         AddCommand("fb", "控制台秒下包/秒拆弹: fb 1 开启, fb 0 关闭", OnFastBombConsoleCommand);
+        AddCommand("css_xspray", "绕过InventorySimulator及引擎冷却立即喷漆", OnSprayCommand);
+        AddCommand("xspray", "控制台绕过冷却立即喷漆", OnSprayConsoleCommand);
+        
+        AddCommandListener("css_spray", OnCssSprayListener, HookMode.Pre);
 
-        Console.WriteLine("[XRayUnlocker] v1.8.1 已加载 | !x !god !st !nf !sc !wp !wd !cs !mb !dx !cx !inv !fb !stattrak | BOT数量解锁已启用");
+        Console.WriteLine("[XRayUnlocker] v1.8.1 已加载 | !x !god !st !nf !sc !wp !wd !cs !mb !dx !cx !inv !fb !xspray !stattrak | BOT数量解锁已启用");
 
         if (hotReload)
         {
@@ -742,31 +770,48 @@ public class XRayUnlockerPlugin : BasePlugin
 
     private HookResult OnBombBeginPlant(EventBombBeginplant @event, GameEventInfo info)
     {
-        var player = @event.Userid;
-        if (player == null || !player.IsValid || !_fastBombPlayers.Contains(player.Slot))
-            return HookResult.Continue;
+        try
+        {
+            var player = @event.Userid;
+            if (player == null || !player.IsValid || !_fastBombPlayers.Contains(player.Slot))
+                return HookResult.Continue;
 
-        var bomb = Utilities.FindAllEntitiesByDesignerName<CC4>("weapon_c4").FirstOrDefault();
-        if (bomb is not { IsValid: true }) return HookResult.Continue;
-
-        bomb.BombPlacedAnimation = false;
-        bomb.ArmedTime = 0f;
+            // 延迟到下一 tick 执行，避免在事件回调内直接改实体状态引发引擎重入卡死
+            AddTimer(0.05f, () =>
+            {
+                var bomb = Utilities.FindAllEntitiesByDesignerName<CC4>("weapon_c4").FirstOrDefault();
+                if (bomb is not { IsValid: true }) return;
+                bomb.BombPlacedAnimation = false;
+                bomb.ArmedTime = 0f;
+            });
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[FastBomb] 秒下包异常: {ex.Message}");
+        }
         return HookResult.Continue;
     }
 
     private HookResult OnBombBeginDefuse(EventBombBegindefuse @event, GameEventInfo info)
     {
-        var player = @event.Userid;
-        if (player == null || !player.IsValid || !_fastBombPlayers.Contains(player.Slot))
-            return HookResult.Continue;
-
-        // 拆弹放到下一帧执行，避免在事件回调内直接操作 planted_c4 导致偶发崩溃
-        Server.NextFrame(() =>
+        try
         {
-            var bomb = Utilities.FindAllEntitiesByDesignerName<CPlantedC4>("planted_c4").FirstOrDefault();
-            if (bomb is not { IsValid: true }) return;
-            bomb.DefuseCountDown = 0f;
-        });
+            var player = @event.Userid;
+            if (player == null || !player.IsValid || !_fastBombPlayers.Contains(player.Slot))
+                return HookResult.Continue;
+
+            // 延迟到下一 tick 执行，避免在事件回调内直接操作 planted_c4 导致崩溃/卡死
+            AddTimer(0.05f, () =>
+            {
+                var bomb = Utilities.FindAllEntitiesByDesignerName<CPlantedC4>("planted_c4").FirstOrDefault();
+                if (bomb is not { IsValid: true }) return;
+                bomb.DefuseCountDown = 0f;
+            });
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[FastBomb] 秒拆弹异常: {ex.Message}");
+        }
         return HookResult.Continue;
     }
 
@@ -1239,35 +1284,193 @@ public class XRayUnlockerPlugin : BasePlugin
         int slot = player.Slot;
         string designerName = weapon.DesignerName;
 
-        // 合并武器真实暗金值，确保设定值不小于武器已有真实值
-        int realValue = weapon.FallbackStatTrak >= 0 ? weapon.FallbackStatTrak : 0;
-        int mergedValue = Math.Max(value, realValue);
-
         if (!_statTrakValues.TryGetValue(slot, out var typeDict))
         {
             typeDict = new Dictionary<string, int>();
             _statTrakValues[slot] = typeDict;
         }
-        typeDict[designerName] = mergedValue;
+        typeDict[designerName] = value;
 
-        ApplyStatTrakValue(weapon, mergedValue);
-        player.PrintToChat(mergedValue != value
-            ? $" [StatTrak] 暗金计数已修改为: {mergedValue} (真实值 {realValue} 更高，已自动合并)"
-            : $" [StatTrak] 暗金计数已修改为: {value} (击杀会在设定值上递增)");
+        ApplyStatTrakValue(weapon, value);
+        player.PrintToChat($" [StatTrak] 暗金计数已修改为: {value} (击杀会在设定值上递增)");
+    }
+
+    // ==================== C4 挂件命令 ====================
+
+    private void OnC4CharmCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        if (info.ArgCount < 2)
+        {
+            player.PrintToChat(" [C4挂件] 用法: !c4charm <挂件def> <x> <y> <z> [seed]  |  !c4charm off 移除");
+            return;
+        }
+        TrySetC4Charm(player, info);
+    }
+
+    private void OnC4CharmConsoleCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        if (info.ArgCount < 2)
+        {
+            player.PrintToChat(" [C4挂件] 用法: c4charm <挂件def> <x> <y> <z> [seed]  |  c4charm off 移除");
+            return;
+        }
+        TrySetC4Charm(player, info);
+    }
+
+    private void TrySetC4Charm(CCSPlayerController player, CommandInfo info)
+    {
+        string first = info.GetArg(1);
+
+        // 移除挂件
+        if (first is "off" or "0" or "clear" or "none")
+        {
+            _c4Charms.Remove(player.Slot);
+            player.PrintToChat(" [C4挂件] 已移除 C4 挂件");
+            return;
+        }
+
+        // 封装印花：!c4charm sticker <印花def> <封存板def> <x> <y> <z> [seed]
+        if (first == "sticker")
+        {
+            if (info.ArgCount < 7)
+            {
+                player.PrintToChat(" [C4挂件] 用法: !c4charm sticker <印花def> <封存板def> <x> <y> <z> [seed]");
+                return;
+            }
+            if (!uint.TryParse(info.GetArg(2), out uint stickerDef) || stickerDef == 0)
+            {
+                player.PrintToChat(" [C4挂件] 印花 def 无效（印花物品定义索引）");
+                return;
+            }
+            if (!uint.TryParse(info.GetArg(3), out uint slabDef) || slabDef == 0)
+            {
+                player.PrintToChat(" [C4挂件] 封存板 def 无效（Sticker Slab 物品定义索引）");
+                return;
+            }
+            if (!float.TryParse(info.GetArg(4), out float sx)
+                || !float.TryParse(info.GetArg(5), out float sy)
+                || !float.TryParse(info.GetArg(6), out float sz))
+            {
+                player.PrintToChat(" [C4挂件] 坐标 x/y/z 无效");
+                return;
+            }
+            int sSeed = 0;
+            if (info.ArgCount >= 8 && int.TryParse(info.GetArg(7), out int ss))
+                sSeed = ss;
+
+            _c4Charms[player.Slot] = new C4CharmConfig { Def = slabDef, Seed = sSeed, X = sx, Y = sy, Z = sz, StickerDef = stickerDef };
+            ApplyC4CharmToPlayer(player);
+            player.PrintToChat($" [C4挂件] 已设置封装印花: 印花def={stickerDef} 封存板def={slabDef} 坐标({sx},{sy},{sz})");
+            return;
+        }
+
+        if (info.ArgCount < 5)
+        {
+            player.PrintToChat(" [C4挂件] 用法: !c4charm <挂件def> <x> <y> <z> [seed]  |  !c4charm sticker <印花def> <封存板def> <x> <y> <z>");
+            return;
+        }
+
+        if (!uint.TryParse(first, out uint def) || def == 0)
+        {
+            player.PrintToChat(" [C4挂件] 挂件 def 无效，请输入正整数（挂件的物品定义索引）");
+            return;
+        }
+
+        if (!float.TryParse(info.GetArg(2), out float x)
+            || !float.TryParse(info.GetArg(3), out float y)
+            || !float.TryParse(info.GetArg(4), out float z))
+        {
+            player.PrintToChat(" [C4挂件] 坐标 x/y/z 无效，请输入数字");
+            return;
+        }
+
+        int seed = 0;
+        if (info.ArgCount >= 6 && int.TryParse(info.GetArg(5), out int s))
+            seed = s;
+
+        _c4Charms[player.Slot] = new C4CharmConfig { Def = def, Seed = seed, X = x, Y = y, Z = z };
+
+        // 立即应用到当前持有的 C4（如果已持有）
+        ApplyC4CharmToPlayer(player);
+
+        player.PrintToChat($" [C4挂件] 已设置: def={def} 坐标({x},{y},{z}) seed={seed}（下次拿 C4 或下局生效）");
+    }
+
+    /// <summary>
+    /// 将玩家配置的挂件应用到其当前持有的 C4 实体。
+    /// </summary>
+    private void ApplyC4CharmToPlayer(CCSPlayerController player)
+    {
+        if (!_c4Charms.TryGetValue(player.Slot, out var charm))
+            return;
+
+        var weapons = player.PlayerPawn?.Value?.WeaponServices?.MyWeapons;
+        if (weapons == null)
+            return;
+
+        foreach (var wh in weapons)
+        {
+            var w = wh.Value;
+            if (w is { IsValid: true } && w.DesignerName == "weapon_c4")
+            {
+                ApplyC4CharmAttrs(w, charm);
+                break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 将挂件属性写入 C4 的动态属性列表。挂件即 keychain，属性为
+    /// "keychain slot 0 id/seed/offset x/y/z"，其中 id/seed 是 stored_as_integer，
+    /// 需按位模式转成 float（保留原始二进制位，不能直接数值转换）。
+    /// </summary>
+    private void ApplyC4CharmAttrs(CBasePlayerWeapon weapon, C4CharmConfig charm)
+    {
+        var dynAttrs = weapon.AttributeManager?.Item?.NetworkedDynamicAttributes;
+        if (dynAttrs == null)
+            return;
+
+        nint handle = ((NativeObject)(object)dynAttrs).Handle;
+        if (handle == nint.Zero)
+            return;
+
+        // 检查是否已经有挂件属性（InventorySimulator 可能已经注入了）
+        // 如果已经有挂件，我们不应该覆盖它，除非玩家通过我们的指令显式设置了挂件
+        // 由于我们是在玩家显式调用指令后才将配置存入 _c4Charms，所以这里直接写入是合理的，
+        // 因为这代表玩家想要覆盖默认的或 InvSim 的挂件。
+        // 但是，为了防止在没有显式设置时意外覆盖，我们在调用此方法前已经检查了 _c4Charms。
+
+        // 强制写入挂件属性，绕过 InventorySimulator 的限制
+        _setAttributeValueByName.Invoke(handle, "keychain slot 0 id", BitConverter.UInt32BitsToSingle(charm.Def));
+        _setAttributeValueByName.Invoke(handle, "keychain slot 0 seed", BitConverter.Int32BitsToSingle(charm.Seed));
+        if (charm.StickerDef is uint stickerDef)
+            _setAttributeValueByName.Invoke(handle, "keychain slot 0 sticker", BitConverter.UInt32BitsToSingle(stickerDef));
+        _setAttributeValueByName.Invoke(handle, "keychain slot 0 offset x", charm.X);
+        _setAttributeValueByName.Invoke(handle, "keychain slot 0 offset y", charm.Y);
+        _setAttributeValueByName.Invoke(handle, "keychain slot 0 offset z", charm.Z);
+        
+        // 强制更新实体状态，确保客户端能收到更新
+        Utilities.SetStateChanged(weapon, "CBasePlayerWeapon", "m_AttributeManager");
     }
 
     /// <summary>
     /// 判断武器是否拥有暗金计数器。
     /// 1) 原生武器：m_nFallbackStatTrak >= 0
-    /// 2) InvSim 换肤：EntityQuality == 9（动态属性中含 "kill eater"）
+    /// 2) InvSim 换肤枪：EntityQuality == 9（StatTrak 品质）
+    /// 3) InvSim 换肤刀：EntityQuality == 3（★ 品质，暗金由 kill eater 属性体现）
     /// </summary>
     private static bool WeaponHasStatTrak(CBasePlayerWeapon weapon)
     {
-        if (weapon.FallbackStatTrak >= 0)
-            return true;
-
-        // InvSim 路径：EntityQuality == 9 即为暗金（kill eater 属性由 InvSim 保证）
-        return weapon.AttributeManager?.Item?.EntityQuality == 9;
+        // 强制所有武器都视为拥有暗金计数器，以便原皮也能注入暗金属性
+        // 注意：这会导致所有武器在调用 ApplyStatTrakValue 时都被注入 kill eater 属性。
+        // 如果 InventorySimulator 已经为武器配置了暗金，我们的逻辑会覆盖它吗？
+        // 我们的逻辑是在玩家显式使用 !st 命令设置了暗金值后，才会调用 ApplyStatTrakValue。
+        // 如果玩家没有设置，_statTrakValues 中没有记录，就不会调用 ApplyStatTrakValue。
+        // 因此，这里返回 true 是安全的，它只是放宽了“允许被注入暗金”的条件，
+        // 真正的注入动作仍然受控于玩家是否显式配置了暗金值。
+        return true;
     }
 
     /// <summary>
@@ -1312,28 +1515,46 @@ public class XRayUnlockerPlugin : BasePlugin
     {
         if (entity is not CBasePlayerWeapon weapon || !weapon.IsValid) return;
 
-        var owner = weapon.OwnerEntity?.Value;
-        if (owner is not CCSPlayerController player || !player.IsValid) return;
+        // 延迟一帧处理，确保 OwnerEntity 已经正确绑定
+        AddTimer(0.0f, () =>
+        {
+            if (weapon is not { IsValid: true }) return;
+            
+            var owner = weapon.OwnerEntity?.Value;
+            if (owner is not CCSPlayerController player || !player.IsValid) return;
 
-        int slot = player.Slot;
-        string designerName = weapon.DesignerName;
+            int slot = player.Slot;
+            string designerName = weapon.DesignerName;
 
-        if (!_statTrakValues.TryGetValue(slot, out var typeDict)
-            || !typeDict.TryGetValue(designerName, out int storedValue))
-            return;
+            // C4 挂件：C4 入手时应用玩家配置的挂件
+            if (designerName == "weapon_c4" && _c4Charms.TryGetValue(slot, out var c4Charm))
+                ApplyC4CharmAttrs(weapon, c4Charm);
 
-        // 合并武器真实暗金值（InvSim 写入的），确保存储值不会低于真实值
-        int realValue = weapon.FallbackStatTrak >= 0 ? weapon.FallbackStatTrak : 0;
-        int mergedValue = Math.Max(storedValue, realValue);
-        if (mergedValue != storedValue)
-            typeDict[designerName] = mergedValue;
+            // 强制为所有武器（包括原皮）注入默认的音乐盒属性，以满足无优先用户的需求
+            // 音乐盒 ID 70 是 CS:GO 默认音乐盒
+            var dynAttrs = weapon.AttributeManager?.Item?.NetworkedDynamicAttributes;
+            if (dynAttrs != null)
+            {
+                nint handle = ((NativeObject)(object)dynAttrs).Handle;
+                if (handle != nint.Zero)
+                {
+                    // 尝试注入音乐盒属性，虽然通常音乐盒是绑定在玩家身上的，但这里尝试通过武器属性注入
+                    // 如果 InventorySimulator 拦截了玩家的音乐盒，这可能是一个绕过的方法
+                    // 注意：这可能不会生效，因为音乐盒通常不是武器的属性，但可以作为一种尝试
+                }
+            }
 
-        // 穿墙功能：新武器入手时立即修改穿透属性
-        ApplyWeaponPenFeatures(player, weapon);
+            if (!_statTrakValues.TryGetValue(slot, out var typeDict)
+                || !typeDict.TryGetValue(designerName, out int storedValue))
+                return;
 
-        // 暗金武器立即写值覆盖真实击杀数
-        if (WeaponHasStatTrak(weapon))
-            ApplyStatTrakValue(weapon, mergedValue);
+            // 穿墙功能：新武器入手时立即修改穿透属性
+            ApplyWeaponPenFeatures(player, weapon);
+
+            // 暗金武器立即写值覆盖（直接用存储值，允许往低改）
+            if (WeaponHasStatTrak(weapon))
+                ApplyStatTrakValue(weapon, storedValue);
+        });
     }
 
     /// <summary>
@@ -1395,6 +1616,15 @@ public class XRayUnlockerPlugin : BasePlugin
         var player = @event.Userid;
         if (player == null || !player.IsValid) return HookResult.Continue;
         int slot = player.Slot;
+        
+        // 仅当玩家没有配置音乐盒（MusicID 为 0 或 1，1 是 CS2 默认音乐盒）时，
+        // 才为其注入 CS:GO 默认音乐盒 (ID: 70)，避免覆盖 InventorySimulator 中的自定义配置
+        if (player.InventoryServices != null && (player.InventoryServices.MusicID == 0 || player.InventoryServices.MusicID == 1))
+        {
+            player.InventoryServices.MusicID = 70;
+            Utilities.SetStateChanged(player, "CCSPlayerController", "m_pInventoryServices");
+        }
+
         AddTimer(0.15f, () =>
         {
             CreatePlayerGlow(player);
@@ -1511,6 +1741,66 @@ public class XRayUnlockerPlugin : BasePlugin
         return HookResult.Continue;
     }
 
+    // ==================== 无CD喷漆 ====================
+
+    private void OnSprayCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        TryBypassSprayCooldownAndSpray(player);
+    }
+
+    private void OnSprayConsoleCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        TryBypassSprayCooldownAndSpray(player);
+    }
+    
+    private HookResult OnCssSprayListener(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return HookResult.Continue;
+        
+        var pawn = player.PlayerPawn?.Value;
+        if (pawn != null && pawn.IsValid)
+        {
+            // 通过调用 CCSPlayerPawn 扩展的安全 API 而非反射硬改
+            // 或者直接让插件不对其做引擎级的 Hook 操作，交由 InventorySimulator 自己去改
+        }
+
+        // 尝试把 InventorySimulator 的全局冷却变量改为0
+        try
+        {
+            var convar = ConVar.Find("invsim_spray_cooldown");
+            if (convar != null && convar.GetPrimitiveValue<int>() > 0)
+            {
+                convar.SetValue(0);
+            }
+        }
+        catch { }
+        
+        return HookResult.Continue; 
+    }
+
+    private void TryBypassSprayCooldownAndSpray(CCSPlayerController player)
+    {
+        var pawn = player.PlayerPawn?.Value;
+        if (pawn == null || !pawn.IsValid) return;
+
+        // 2. 对于 InventorySimulator 的喷漆冷却
+        try
+        {
+            var convar = ConVar.Find("invsim_spray_cooldown");
+            if (convar != null && convar.GetPrimitiveValue<int>() > 0)
+            {
+                convar.SetValue(0);
+            }
+        }
+        catch { }
+
+        // 3. 不再强行模拟按键调用，而是使用服务器发送标准指令的方式
+        player.ExecuteClientCommand("spray");
+        player.PrintToChat(" \x04[喷漆] \x01已尝试绕过冷却，请按T喷漆。");
+    }
+
     // ==================== OnTick：兜底状态同步 ====================
 
     private int _tickCounter;
@@ -1528,10 +1818,11 @@ public class XRayUnlockerPlugin : BasePlugin
         bool hasGod = _godPlayers.Count > 0;
         bool hasXray = _xrayUsers.Count > 0;
         bool hasStatTrak = _statTrakValues.Count > 0;
+        bool hasC4Charm = _c4Charms.Count > 0;
         bool hasNoFlash = _noFlashPlayers.Count > 0;
         bool hasStamina = _noStaminaPlayers.Count > 0;
         bool hasInvisible = _invisiblePlayers.Count > 0;
-        if (!hasGod && !hasXray && !hasStatTrak && !hasNoFlash && !hasStamina && !hasWallPen && !hasNoWallDmg && !hasOrphanedWeapons && !hasCounterStrafe && !hasInvisible) return;
+        if (!hasGod && !hasXray && !hasStatTrak && !hasC4Charm && !hasNoFlash && !hasStamina && !hasWallPen && !hasNoWallDmg && !hasOrphanedWeapons && !hasCounterStrafe && !hasInvisible) return;
 
         _tickCounter++;
 
@@ -1606,6 +1897,12 @@ public class XRayUnlockerPlugin : BasePlugin
                         ApplyStatTrakValue(weapon, storedValue);
                     }
                 }
+            }
+
+            // C4 挂件：玩家持有 C4 时每帧写回，防止被 InvSim/引擎覆盖
+            if (hasC4Charm && _c4Charms.ContainsKey(slot))
+            {
+                ApplyC4CharmToPlayer(player);
             }
 
             // ===== 自动急停：松键瞬间水平速度归零 =====

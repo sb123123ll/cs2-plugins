@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../game/csgo/addons/counterstrikesharp/plugins/InventorySimulator"
+		}
+	],
+	"settings": {}
+}

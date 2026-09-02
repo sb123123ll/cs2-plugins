@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("XRayUnlocker")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+4dca5077cea2535bf3740d01355a6355666bc4e0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+fa3dcd893517347c1bc8f1fe72aa5607d20f0331")]
 [assembly: System.Reflection.AssemblyProductAttribute("XRayUnlocker")]
 [assembly: System.Reflection.AssemblyTitleAttribute("XRayUnlocker")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
