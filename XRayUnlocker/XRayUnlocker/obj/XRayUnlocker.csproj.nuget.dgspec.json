@@ -1,17 +1,17 @@
 {
   "format": 1,
   "restore": {
-    "G:\\SteamLibrary\\steamapps\\common\\Counter-Strike Global Offensive\\cs2-plugins\\XRayUnlocker\\XRayUnlocker\\XRayUnlocker.csproj": {}
+    "g:\\SteamLibrary\\steamapps\\common\\Counter-Strike Global Offensive\\cs2-plugins\\XRayUnlocker\\XRayUnlocker\\XRayUnlocker.csproj": {}
   },
   "projects": {
-    "G:\\SteamLibrary\\steamapps\\common\\Counter-Strike Global Offensive\\cs2-plugins\\XRayUnlocker\\XRayUnlocker\\XRayUnlocker.csproj": {
+    "g:\\SteamLibrary\\steamapps\\common\\Counter-Strike Global Offensive\\cs2-plugins\\XRayUnlocker\\XRayUnlocker\\XRayUnlocker.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "G:\\SteamLibrary\\steamapps\\common\\Counter-Strike Global Offensive\\cs2-plugins\\XRayUnlocker\\XRayUnlocker\\XRayUnlocker.csproj",
+        "projectUniqueName": "g:\\SteamLibrary\\steamapps\\common\\Counter-Strike Global Offensive\\cs2-plugins\\XRayUnlocker\\XRayUnlocker\\XRayUnlocker.csproj",
         "projectName": "XRayUnlocker",
-        "projectPath": "G:\\SteamLibrary\\steamapps\\common\\Counter-Strike Global Offensive\\cs2-plugins\\XRayUnlocker\\XRayUnlocker\\XRayUnlocker.csproj",
+        "projectPath": "g:\\SteamLibrary\\steamapps\\common\\Counter-Strike Global Offensive\\cs2-plugins\\XRayUnlocker\\XRayUnlocker\\XRayUnlocker.csproj",
         "packagesPath": "C:\\Users\\thunder\\.nuget\\packages\\",
-        "outputPath": "G:\\SteamLibrary\\steamapps\\common\\Counter-Strike Global Offensive\\cs2-plugins\\XRayUnlocker\\XRayUnlocker\\obj\\",
+        "outputPath": "g:\\SteamLibrary\\steamapps\\common\\Counter-Strike Global Offensive\\cs2-plugins\\XRayUnlocker\\XRayUnlocker\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
           "C:\\Users\\thunder\\AppData\\Roaming\\NuGet\\NuGet.Config"

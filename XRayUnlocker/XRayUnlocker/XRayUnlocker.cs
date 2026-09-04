@@ -35,9 +35,26 @@ namespace XRayUnlocker;
 public class XRayUnlockerPlugin : BasePlugin
 {
     public override string ModuleName => "XRayUnlocker";
-    public override string ModuleVersion => "1.8.1";
+    public override string ModuleVersion => "1.8.3";
     public override string ModuleAuthor => "CS2 Local Server";
-    public override string ModuleDescription => "透视 !x + 无敌 !god + 暗金 !st + 防闪 !nf + 蹲起 !sc + 全图可穿 !wp + 穿墙无衰减 !wd + 自动急停 !cs + 魔法子弹 !mb + 掉落物透视 !dx + C4透视 !cx + 隐身 !inv + 秒下包秒拆弹 !fb + BOT数量解锁 + 暗金JSON持久化 !stattrak";
+    public override string ModuleDescription => "透视 !x + 无敌 !god + 暗金 !st + 防闪 !nf + 蹲起 !sc + 全图可穿 !wp + 穿墙无衰减 !wd + 自动急停 !cs + 锁定空手速度 !sp + 魔法子弹 !mb + 掉落物透视 !dx + C4透视 !cx + 隐身 !inv + 秒下包秒拆弹 !fb + 无限烟火 !inf + BOT数量解锁 + 暗金JSON持久化 !stattrak";
+
+    // ==================== 无限烟火（!inf / inf）====================
+    // 开启该功能的玩家丢出的烟雾弹、燃烧弹/火不会随时间消散
+    // 中途关闭指令则恢复正常倒计时，再次打开若还存在则继续维持
+    private readonly HashSet<int> _infiniteGrenadePlayers = new();
+    // 实体索引 → (所属玩家 slot, 原始初始 tick / lifetime)
+    private readonly Dictionary<uint, (int Slot, int OrigTick)> _trackedSmokes = new();
+    private readonly Dictionary<uint, (int Slot, float OrigLifetime, int OrigTick)> _trackedInfernos = new();
+    // molotov/incendiary 引爆点缓存：自增 key → (投掷者 slot, 引爆 tick, 位置)
+    // 用于 inferno_startburn 无投掷者字段时的归属回溯
+    private readonly Dictionary<int, (int Slot, int Tick, float X, float Y, float Z)> _recentMolotovDet = new();
+    private int _molotovDetCounter;
+
+    // ==================== 锁定空手移速（!sp / sp）====================
+    // CS2 赤手空拳（及持刀、C4）的标准奔跑速度是 250 u/s
+    private const float UnarmedMaxSpeed = 250.0f;
+    private readonly HashSet<int> _unarmedSpeedPlayers = new();
 
     // ==================== 玩家透视 ====================
     private readonly Dictionary<int, (CDynamicProp relay, CDynamicProp glow)> _playerGlows = new();
@@ -353,6 +370,9 @@ public class XRayUnlockerPlugin : BasePlugin
         RegisterEventHandler<EventBombPlanted>(OnBombPlanted);
         RegisterEventHandler<EventBombDefused>(OnBombDefused);
         RegisterEventHandler<EventBombExploded>(OnBombExploded);
+        RegisterEventHandler<EventSmokegrenadeDetonate>(OnSmokeGrenadeDetonate);
+        RegisterEventHandler<EventInfernoStartburn>(OnInfernoStartBurn);
+        RegisterEventHandler<EventMolotovDetonate>(OnMolotovDetonate);
         // 秒下包/秒拆弹事件：单独保护，避免注册异常拖垮整个插件加载
         try
         {
@@ -386,6 +406,8 @@ public class XRayUnlockerPlugin : BasePlugin
         AddCommand("wd", "控制台穿墙无衰减: wd 1 开启, wd 0 关闭", OnWallDmgReductionConsoleCommand);
         AddCommand("css_cs", "开关自动急停（松键瞬间停稳，无需反方向键）", OnCounterStrafeCommand);
         AddCommand("cs", "控制台自动急停: cs 1 开启, cs 0 关闭", OnCounterStrafeConsoleCommand);
+        AddCommand("css_sp", "开关锁定空手速度（250 u/s，无论手持任何武器或开镜）", OnUnarmedSpeedCommand);
+        AddCommand("sp", "控制台锁定空手速度: sp 1 开启, sp 0 关闭", OnUnarmedSpeedConsoleCommand);
         AddCommand("css_mb", "开关魔法子弹（瞄准大致方向自动命中最近敌人）", OnMagicBulletCommand);
         AddCommand("mb", "控制台魔法子弹: mb 1 开启, mb 0 关闭", OnMagicBulletConsoleCommand);
         AddCommand("css_dx", "开关掉落物透视（地上武器/道具/拆弹器 淡黄边框）", OnDropXrayCommand);
@@ -396,12 +418,14 @@ public class XRayUnlockerPlugin : BasePlugin
         AddCommand("inv", "控制台隐身: inv 1 开启, inv 0 关闭", OnInvisConsoleCommand);
         AddCommand("css_fb", "开关秒下包/秒拆弹（0.1秒，不分阵营）", OnFastBombCommand);
         AddCommand("fb", "控制台秒下包/秒拆弹: fb 1 开启, fb 0 关闭", OnFastBombConsoleCommand);
+        AddCommand("css_inf", "开关无限烟火（烟雾弹与燃烧弹火焰永不熄灭）", OnInfiniteGrenadeCommand);
+        AddCommand("inf", "控制台无限烟火: inf 1 开启, inf 0 关闭", OnInfiniteGrenadeConsoleCommand);
         AddCommand("css_xspray", "绕过InventorySimulator及引擎冷却立即喷漆", OnSprayCommand);
         AddCommand("xspray", "控制台绕过冷却立即喷漆", OnSprayConsoleCommand);
         
         AddCommandListener("css_spray", OnCssSprayListener, HookMode.Pre);
 
-        Console.WriteLine("[XRayUnlocker] v1.8.1 已加载 | !x !god !st !nf !sc !wp !wd !cs !mb !dx !cx !inv !fb !xspray !stattrak | BOT数量解锁已启用");
+        Console.WriteLine("[XRayUnlocker] v1.8.3 已加载 | !x !god !st !nf !sc !wp !wd !cs !sp !mb !dx !cx !inv !fb !inf !xspray !stattrak | BOT数量解锁已启用");
 
         if (hotReload)
         {
@@ -432,6 +456,11 @@ public class XRayUnlockerPlugin : BasePlugin
         _fullPenPlayers.Clear();
         _noWallDmgReductionPlayers.Clear();
         _counterStrafePlayers.Clear();
+        _unarmedSpeedPlayers.Clear();
+        _infiniteGrenadePlayers.Clear();
+        _trackedSmokes.Clear();
+        _trackedInfernos.Clear();
+        _recentMolotovDet.Clear();
         _magicBulletPlayers.Clear();
         _pendingMagicBulletKills.Clear();
         _dropXrayUsers.Clear();
@@ -1041,6 +1070,226 @@ public class XRayUnlockerPlugin : BasePlugin
             _counterStrafePlayers.Add(slot);
             player.PrintToChat(" [CounterStrafe] 自动急停已开启 - 松键瞬间自动停稳");
         }
+    }
+
+    // ==================== 锁定空手移速（!sp / sp）====================
+    // 原理：CS2 中赤手空拳、持刀与持 C4 的基准最高速度为 250 u/s。
+    // 玩家开启后，OnTick 每帧将 MovementServices 的 Maxspeed 强制锁为 250.0f，
+    // 并保持 VelocityModifier 为 1.0f，从而在手持重武器（如大狙、机枪）、开镜或预投掷道具时，
+    // 基础移动速度依然始终维持在空手/刀速水平（250 u/s）。
+
+    private void OnUnarmedSpeedCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        int slot = player.Slot;
+
+        if (_unarmedSpeedPlayers.Contains(slot))
+        {
+            _unarmedSpeedPlayers.Remove(slot);
+            var pawn = player.PlayerPawn?.Value;
+            if (pawn is { IsValid: true })
+                pawn.VelocityModifier = 1.0f;
+            player.PrintToChat(" [UnarmedSpeed] 锁定空手速度已关闭 - 恢复武器默认移速");
+        }
+        else
+        {
+            _unarmedSpeedPlayers.Add(slot);
+            player.PrintToChat(" [UnarmedSpeed] 锁定空手速度已开启 - 移速锁定为 250 u/s（赤手空拳）");
+        }
+    }
+
+    private void OnUnarmedSpeedConsoleCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        int slot = player.Slot;
+
+        if (info.ArgCount < 2)
+        {
+            player.PrintToChat(" [UnarmedSpeed] 用法: sp 1 开启 / sp 0 关闭");
+            return;
+        }
+
+        if (int.TryParse(info.GetArg(1), out int val) && val == 0)
+        {
+            _unarmedSpeedPlayers.Remove(slot);
+            var pawn = player.PlayerPawn?.Value;
+            if (pawn is { IsValid: true })
+                pawn.VelocityModifier = 1.0f;
+            player.PrintToChat(" [UnarmedSpeed] 锁定空手速度已关闭 - 恢复武器默认移速");
+        }
+        else
+        {
+            _unarmedSpeedPlayers.Add(slot);
+            player.PrintToChat(" [UnarmedSpeed] 锁定空手速度已开启 - 移速锁定为 250 u/s（赤手空拳）");
+        }
+    }
+
+    // ==================== 无限烟火（!inf / inf）====================
+    // 原理：
+    // 1. 烟雾弹（CSmokeGrenadeProjectile）：CS2 烟雾的消散计算是基于当前服务器 Tick 减去 SmokeEffectTickBegin。
+    //    只要每帧（或周期性）将 SmokeEffectTickBegin 刷新为 Server.TickCount，烟雾就永远处于刚爆开的状态，永不消散。
+    // 2. 燃烧弹/火（CInferno）：其燃烧时间由 FireLifetime 控制，同时也有 FireEffectTickBegin。
+    //    当处于无限燃烧时，将其 FireLifetime 延长（或将 FireEffectTickBegin 持续保持在当前 Tick）；
+    // 3. 中途关闭指令：将实体的属性恢复为正常计算或使其在正常时间内（烟雾~20秒，火~7秒）进入自然消散；
+    // 4. 若在消散前重新打开指令，实体若依然在追踪列表中且尚未被引擎销毁，则重新恢复无限时间！
+
+    private void OnInfiniteGrenadeCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        int slot = player.Slot;
+
+        if (_infiniteGrenadePlayers.Contains(slot))
+        {
+            _infiniteGrenadePlayers.Remove(slot);
+            // 让该玩家现存烟雾/火焰恢复自然消散（重新从满时长倒计时）
+            ReleaseInfiniteGrenades(slot);
+            player.PrintToChat(" [InfGrenade] 无限烟火已关闭 - 之前丢出的烟雾/火焰将在正常时间内消散");
+        }
+        else
+        {
+            _infiniteGrenadePlayers.Add(slot);
+            player.PrintToChat(" [InfGrenade] 无限烟火已开启 - 你丢出的烟雾弹与燃烧弹火焰永不熄灭！");
+        }
+    }
+
+    private void OnInfiniteGrenadeConsoleCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || !player.IsValid) return;
+        int slot = player.Slot;
+
+        if (info.ArgCount < 2)
+        {
+            player.PrintToChat(" [InfGrenade] 用法: inf 1 开启 / inf 0 关闭");
+            return;
+        }
+
+        if (int.TryParse(info.GetArg(1), out int val) && val == 0)
+        {
+            _infiniteGrenadePlayers.Remove(slot);
+            ReleaseInfiniteGrenades(slot);
+            player.PrintToChat(" [InfGrenade] 无限烟火已关闭 - 之前丢出的烟雾/火焰将在正常时间内消散");
+        }
+        else
+        {
+            _infiniteGrenadePlayers.Add(slot);
+            player.PrintToChat(" [InfGrenade] 无限烟火已开启 - 你丢出的烟雾弹与燃烧弹火焰永不熄灭！");
+        }
+    }
+
+    /// <summary>
+    /// 关闭功能时调用：将该玩家名下的烟雾/火焰从“无限维持”切换回“自然倒计时”。
+    /// 烟雾：开始帧刷新为当前帧（重新走一遍约 18s 的完整消散流程）；
+    /// 火焰：把 FireLifetime 恢复为记录时的原始寿命，开始帧刷新为当前帧。
+    /// </summary>
+    private void ReleaseInfiniteGrenades(int slot)
+    {
+        int now = Server.TickCount;
+
+        foreach (var kv in _trackedSmokes.Where(kv => kv.Value.Slot == slot).ToList())
+        {
+            var smoke = Utilities.GetEntityFromIndex<CSmokeGrenadeProjectile>((int)kv.Key);
+            if (smoke is { IsValid: true })
+            {
+                smoke.SmokeEffectTickBegin = now;
+                Utilities.SetStateChanged(smoke, "CSmokeGrenadeProjectile", "m_nSmokeEffectTickBegin");
+            }
+        }
+
+        foreach (var kv in _trackedInfernos.Where(kv => kv.Value.Slot == slot).ToList())
+        {
+            var inferno = Utilities.GetEntityFromIndex<CInferno>((int)kv.Key);
+            if (inferno is { IsValid: true })
+            {
+                inferno.FireLifetime = kv.Value.OrigLifetime;
+                inferno.FireEffectTickBegin = now;
+                Utilities.SetStateChanged(inferno, "CInferno", "m_flFireLifetime");
+                Utilities.SetStateChanged(inferno, "CInferno", "m_nFireEffectTickBegin");
+            }
+        }
+    }
+
+    private HookResult OnSmokeGrenadeDetonate(EventSmokegrenadeDetonate @event, GameEventInfo info)
+    {
+        var thrower = @event.Userid;
+        if (thrower == null || !thrower.IsValid) return HookResult.Continue;
+        int slot = thrower.Slot;
+
+        // 无论当前该玩家是否处于开启状态，都记录该实体及其原始开始帧，以便中途开启/关闭时切换
+        var smoke = Utilities.GetEntityFromIndex<CSmokeGrenadeProjectile>(@event.Entityid);
+        if (smoke is { IsValid: true })
+        {
+            uint idx = smoke.Index;
+            _trackedSmokes[idx] = (slot, smoke.SmokeEffectTickBegin);
+        }
+
+        return HookResult.Continue;
+    }
+
+    /// <summary>molotov / 燃烧弹引爆：记录投掷者归属与引爆位置，供 inferno 起点归属回溯</summary>
+    private HookResult OnMolotovDetonate(EventMolotovDetonate @event, GameEventInfo info)
+    {
+        var thrower = @event.Userid;
+        if (thrower == null || !thrower.IsValid) return HookResult.Continue;
+
+        // 清理过期记录（引爆后 1.5 秒内 inferno 必须已生成）
+        int now = Server.TickCount;
+        foreach (var key in _recentMolotovDet.Where(kv => now - kv.Value.Tick > 128).Select(kv => kv.Key).ToList())
+            _recentMolotovDet.Remove(key);
+
+        _recentMolotovDet[++_molotovDetCounter] = (thrower.Slot, now, @event.X, @event.Y, @event.Z);
+        return HookResult.Continue;
+    }
+
+    private HookResult OnInfernoStartBurn(EventInfernoStartburn @event, GameEventInfo info)
+    {
+        var inferno = Utilities.GetEntityFromIndex<CInferno>(@event.Entityid);
+        if (inferno is { IsValid: true })
+        {
+            int slot = -1;
+            // 尝试通过 OwnerEntity 获取投掷者 Controller
+            var owner = inferno.OwnerEntity?.Value;
+            if (owner is CCSPlayerController ctrl && ctrl.IsValid)
+            {
+                slot = ctrl.Slot;
+            }
+            else if (owner is CCSPlayerPawn pawn && pawn.IsValid)
+            {
+                var pawnCtrl = pawn.Controller?.Value as CCSPlayerController;
+                if (pawnCtrl is { IsValid: true })
+                    slot = pawnCtrl.Slot;
+            }
+
+            // OwnerEntity 未能定位 → 通过最近的 molotov 引爆记录回溯投掷者
+            if (slot == -1)
+            {
+                int now = Server.TickCount;
+                int bestKey = -1;
+                float bestDist = 250f; // 与引爆点距离上限（单位）
+                foreach (var kv in _recentMolotovDet)
+                {
+                    if (now - kv.Value.Tick > 128) continue; // 超过 1.5s 视为无关
+                    float dx = kv.Value.X - @event.X;
+                    float dy = kv.Value.Y - @event.Y;
+                    float dz = kv.Value.Z - @event.Z;
+                    float dist = (float)Math.Sqrt(dx * dx + dy * dy + dz * dz);
+                    if (dist < bestDist)
+                    {
+                        bestDist = dist;
+                        bestKey = kv.Key;
+                    }
+                }
+                if (bestKey != -1)
+                    slot = _recentMolotovDet[bestKey].Slot;
+            }
+
+            if (slot != -1)
+            {
+                uint idx = inferno.Index;
+                _trackedInfernos[idx] = (slot, inferno.FireLifetime, inferno.FireEffectTickBegin);
+            }
+        }
+
+        return HookResult.Continue;
     }
 
     // ==================== 魔法子弹（!mb / mb）====================
@@ -1663,6 +1912,11 @@ public class XRayUnlockerPlugin : BasePlugin
         DestroyAllDropGlows();
         DestroyC4Glow();
 
+        // 回合重置：上一回合的烟雾/火焰已被引擎清空，同步清空追踪与引爆缓存
+        _trackedSmokes.Clear();
+        _trackedInfernos.Clear();
+        _recentMolotovDet.Clear();
+
         // 多级重试兜底：pawn、CBodyComponent、SceneNode 都可能在换局后延迟就绪
         AddTimer(0.2f, () => RebuildAllPlayerStates());
         AddTimer(0.5f, () => RebuildAllPlayerStates());
@@ -1815,6 +2069,7 @@ public class XRayUnlockerPlugin : BasePlugin
         bool hasNoWallDmg = _noWallDmgReductionPlayers.Count > 0;
         bool hasOrphanedWeapons = _weaponOrigValues.Count > 0; // 有被修改的武器待恢复（丢地上的枪等）
         bool hasCounterStrafe = _counterStrafePlayers.Count > 0;
+        bool hasUnarmedSpeed = _unarmedSpeedPlayers.Count > 0;
         bool hasGod = _godPlayers.Count > 0;
         bool hasXray = _xrayUsers.Count > 0;
         bool hasStatTrak = _statTrakValues.Count > 0;
@@ -1822,7 +2077,8 @@ public class XRayUnlockerPlugin : BasePlugin
         bool hasNoFlash = _noFlashPlayers.Count > 0;
         bool hasStamina = _noStaminaPlayers.Count > 0;
         bool hasInvisible = _invisiblePlayers.Count > 0;
-        if (!hasGod && !hasXray && !hasStatTrak && !hasC4Charm && !hasNoFlash && !hasStamina && !hasWallPen && !hasNoWallDmg && !hasOrphanedWeapons && !hasCounterStrafe && !hasInvisible) return;
+        bool hasInfiniteGrenade = _trackedSmokes.Count > 0 || _trackedInfernos.Count > 0;
+        if (!hasGod && !hasXray && !hasStatTrak && !hasC4Charm && !hasNoFlash && !hasStamina && !hasWallPen && !hasNoWallDmg && !hasOrphanedWeapons && !hasCounterStrafe && !hasUnarmedSpeed && !hasInvisible && !hasInfiniteGrenade) return;
 
         _tickCounter++;
 
@@ -1927,6 +2183,66 @@ public class XRayUnlockerPlugin : BasePlugin
                 }
             }
 
+            // ===== 锁定空手速度：手持任何武器/开镜/投掷/开火均保持 250 u/s =====
+            // CS2 机制说明：
+            // 1. MovementServices.Maxspeed 在 CS2 引擎每帧计算移动时会被当前持有的武器 VData 基础速度覆盖；
+            // 2. 引擎计算玩家最终奔跑速度的公式是：最终速度 = WeaponBaseSpeed * pawn.VelocityModifier；
+            // 3. 部分武器（如内格夫、P90、连狙等）在持续开火时，引擎会额外乘以 AttackMovespeedFactor（通常为 0.5~0.8）；
+            //    同时按住开火键时（PlayerButtons.Attack），需要将 AttackMovespeedFactor 一并补偿回去；
+            // 4. 因此，动态计算综合补偿倍率：VelocityModifier = 250.0f / (weaponBaseSpeed * attackFactor)，
+            //    即可实现无论手持重武器、开镜还是开火扫射，巡航移速都稳定保持在 250 u/s（赤手空拳速度）。
+            if (hasUnarmedSpeed && _unarmedSpeedPlayers.Contains(slot))
+            {
+                var pawn = player.PlayerPawn?.Value;
+                if (pawn is { IsValid: true })
+                {
+                    float currentWeaponSpeed = UnarmedMaxSpeed;
+                    float attackFactor = 1.0f;
+                    var activeWpn = pawn.WeaponServices?.ActiveWeapon?.Value;
+                    if (activeWpn is { IsValid: true })
+                    {
+                        var vdata = activeWpn.GetVData<CCSWeaponBaseVData>();
+                        if (vdata != null)
+                        {
+                            if (vdata.MaxSpeed != null && vdata.MaxSpeed.Values.Length > 0)
+                            {
+                                // 如果处于开镜状态且有第2档开镜速度
+                                if (pawn.IsScoped && vdata.MaxSpeed.Values.Length > 1 && vdata.MaxSpeed.Values[1] > 0)
+                                {
+                                    currentWeaponSpeed = vdata.MaxSpeed.Values[1];
+                                }
+                                else if (vdata.MaxSpeed.Values[0] > 0)
+                                {
+                                    currentWeaponSpeed = vdata.MaxSpeed.Values[0];
+                                }
+                            }
+
+                            // 检查持续开火减速：如果玩家正在按住开火键，且武器有开火减速系数（AttackMovespeedFactor < 1.0）
+                            bool isAttacking = (player.Buttons & PlayerButtons.Attack) != 0;
+                            if (isAttacking && vdata.AttackMovespeedFactor > 0.05f && vdata.AttackMovespeedFactor < 0.99f)
+                            {
+                                attackFactor = vdata.AttackMovespeedFactor;
+                            }
+                        }
+                    }
+
+                    float effectiveSpeed = currentWeaponSpeed * attackFactor;
+                    if (effectiveSpeed > 0)
+                    {
+                        pawn.VelocityModifier = UnarmedMaxSpeed / effectiveSpeed;
+                    }
+                    else
+                    {
+                        pawn.VelocityModifier = 1.0f;
+                    }
+
+                    if (pawn.MovementServices != null)
+                    {
+                        pawn.MovementServices.Maxspeed = UnarmedMaxSpeed;
+                    }
+                }
+            }
+
             // 每 64 帧：XRay glow 缺失修复
             if (_tickCounter % 64 == 0)
             {
@@ -1958,6 +2274,63 @@ public class XRayUnlockerPlugin : BasePlugin
                 c4p.glow.Render = c4p.glow.Render.A == 1
                     ? Color.FromArgb(255, 255, 255, 255)
                     : Color.FromArgb(1, 255, 255, 255);
+        }
+
+        // ===== 无限烟火（!inf）：持续维持烟雾与火焰 =====
+        // 说明：
+        // - 烟雾消散判定基于 (Server.TickCount - SmokeEffectTickBegin) 是否超过持续时间
+        //   因此对开启者丢出的烟雾，每帧把开始帧刷新为当前帧 → 永不进入消散计时；
+        // - 火焰寿命由 FireLifetime 控制，同时也会参考 FireEffectTickBegin 判定熄灭
+        //   开启时把寿命拉大并将开始帧刷新为当前帧 → 火焰永久燃烧；
+        // - 玩家关闭指令后，不再刷新 → 实体按照引擎正常时长自然消散（重新计时）
+        //   在消散前再次打开，实体仍有效，会被重新维持 → 达到“来得及就继续烧”的效果。
+        if (hasInfiniteGrenade)
+        {
+            int nowTick = Server.TickCount;
+
+            if (_trackedSmokes.Count > 0)
+            {
+                foreach (var kv in _trackedSmokes.ToList())
+                {
+                    var smoke = Utilities.GetEntityFromIndex<CSmokeGrenadeProjectile>((int)kv.Key);
+                    if (smoke is not { IsValid: true })
+                    {
+                        // 实体已被引擎销毁（自然消散完毕）→ 移除追踪
+                        _trackedSmokes.Remove(kv.Key);
+                        continue;
+                    }
+
+                    // 玩家已关闭 → 不做维持，让其自然倒计时直至消散
+                    if (!_infiniteGrenadePlayers.Contains(kv.Value.Slot)) continue;
+
+                    // 将烟雾的开始帧刷到当前帧，烟雾永远处于“刚爆开”状态
+                    smoke.SmokeEffectTickBegin = nowTick;
+                    Utilities.SetStateChanged(smoke, "CSmokeGrenadeProjectile", "m_nSmokeEffectTickBegin");
+                }
+            }
+
+            if (_trackedInfernos.Count > 0)
+            {
+                foreach (var kv in _trackedInfernos.ToList())
+                {
+                    var inferno = Utilities.GetEntityFromIndex<CInferno>((int)kv.Key);
+                    if (inferno is not { IsValid: true })
+                    {
+                        // 火焰已被引擎销毁（自然熄灭完毕）→ 移除追踪
+                        _trackedInfernos.Remove(kv.Key);
+                        continue;
+                    }
+
+                    // 玩家已关闭 → 不做维持，让其自然倒计时直至熄灭
+                    if (!_infiniteGrenadePlayers.Contains(kv.Value.Slot)) continue;
+
+                    // 拉大火焰寿命并把开始帧刷到当前帧 → 永不熄灭
+                    inferno.FireLifetime = 999999.0f;
+                    inferno.FireEffectTickBegin = nowTick;
+                    Utilities.SetStateChanged(inferno, "CInferno", "m_flFireLifetime");
+                    Utilities.SetStateChanged(inferno, "CInferno", "m_nFireEffectTickBegin");
+                }
+            }
         }
     }
 
