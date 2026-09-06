@@ -361,6 +361,7 @@ public class XRayUnlockerPlugin : BasePlugin
         RegisterListener<Listeners.CheckTransmit>(OnCheckTransmit);
         RegisterListener<Listeners.OnPlayerTakeDamagePre>(OnPlayerTakeDamagePre);
         RegisterListener<Listeners.OnEntityCreated>(OnWeaponEntityCreated);
+        RegisterListener<Listeners.OnEntityCreated>(OnGrenadeEntityCreated);
         RegisterEventHandler<EventPlayerSpawn>(OnPlayerSpawn);
         RegisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
         RegisterEventHandler<EventRoundStart>(OnRoundStart);
@@ -1178,12 +1179,13 @@ public class XRayUnlockerPlugin : BasePlugin
 
     /// <summary>
     /// 关闭功能时调用：将该玩家名下的烟雾/火焰从“无限维持”切换回“自然倒计时”。
-    /// 烟雾：开始帧刷新为当前帧（重新走一遍约 18s 的完整消散流程）；
-    /// 火焰：把 FireLifetime 恢复为记录时的原始寿命，开始帧刷新为当前帧。
+    /// 烟雾：开始帧刷新为当前帧（重新走一遍约 18s 的完整消散流程），并将 NextThinkTick 恢复为正常触发；
+    /// 火焰：把 FireLifetime 恢复为记录时的原始寿命，重置 ActiveTimer 并恢复 Think。
     /// </summary>
     private void ReleaseInfiniteGrenades(int slot)
     {
         int now = Server.TickCount;
+        float nowTime = Server.CurrentTime;
 
         foreach (var kv in _trackedSmokes.Where(kv => kv.Value.Slot == slot).ToList())
         {
@@ -1191,7 +1193,9 @@ public class XRayUnlockerPlugin : BasePlugin
             if (smoke is { IsValid: true })
             {
                 smoke.SmokeEffectTickBegin = now;
+                smoke.NextThinkTick = now + 64;
                 Utilities.SetStateChanged(smoke, "CSmokeGrenadeProjectile", "m_nSmokeEffectTickBegin");
+                Utilities.SetStateChanged(smoke, "CBaseEntity", "m_nNextThinkTick");
             }
         }
 
@@ -1202,8 +1206,22 @@ public class XRayUnlockerPlugin : BasePlugin
             {
                 inferno.FireLifetime = kv.Value.OrigLifetime;
                 inferno.FireEffectTickBegin = now;
+                inferno.NextThinkTick = now + 4;
+
+                // 恢复正常内部倒计时
+                if (inferno.ActiveTimer != null)
+                {
+                    inferno.ActiveTimer.Timestamp = nowTime;
+                }
+                if (inferno.DamageTimer != null)
+                {
+                    inferno.DamageTimer.Timestamp = nowTime + 0.1f;
+                    inferno.DamageTimer.Duration = 0.1f;
+                }
+
                 Utilities.SetStateChanged(inferno, "CInferno", "m_flFireLifetime");
                 Utilities.SetStateChanged(inferno, "CInferno", "m_nFireEffectTickBegin");
+                Utilities.SetStateChanged(inferno, "CBaseEntity", "m_nNextThinkTick");
             }
         }
     }
@@ -1290,6 +1308,60 @@ public class XRayUnlockerPlugin : BasePlugin
         }
 
         return HookResult.Continue;
+    }
+
+    /// <summary>
+    /// 投掷物/火焰实体创建事件：捕获刚刚生成的烟雾弹投掷物与火焰实体，
+    /// 弥补单独依赖 detonate/startburn 事件在部分地图或引爆模式下丢事件的缺陷。
+    /// </summary>
+    private void OnGrenadeEntityCreated(CEntityInstance entity)
+    {
+        if (entity is CSmokeGrenadeProjectile smoke && smoke.IsValid)
+        {
+            AddTimer(0.05f, () =>
+            {
+                if (smoke is not { IsValid: true }) return;
+                int slot = -1;
+                var thrower = smoke.Thrower?.Value ?? smoke.OwnerEntity?.Value;
+                if (thrower is CCSPlayerController ctrl && ctrl.IsValid)
+                {
+                    slot = ctrl.Slot;
+                }
+                else if (thrower is CCSPlayerPawn pawn && pawn.IsValid)
+                {
+                    var c = pawn.Controller?.Value as CCSPlayerController;
+                    if (c is { IsValid: true }) slot = c.Slot;
+                }
+
+                if (slot != -1 && !_trackedSmokes.ContainsKey(smoke.Index))
+                {
+                    _trackedSmokes[smoke.Index] = (slot, smoke.SmokeEffectTickBegin);
+                }
+            });
+        }
+        else if (entity is CInferno inferno && inferno.IsValid)
+        {
+            AddTimer(0.05f, () =>
+            {
+                if (inferno is not { IsValid: true }) return;
+                int slot = -1;
+                var owner = inferno.OwnerEntity?.Value;
+                if (owner is CCSPlayerController ctrl && ctrl.IsValid)
+                {
+                    slot = ctrl.Slot;
+                }
+                else if (owner is CCSPlayerPawn pawn && pawn.IsValid)
+                {
+                    var c = pawn.Controller?.Value as CCSPlayerController;
+                    if (c is { IsValid: true }) slot = c.Slot;
+                }
+
+                if (slot != -1 && !_trackedInfernos.ContainsKey(inferno.Index))
+                {
+                    _trackedInfernos[inferno.Index] = (slot, inferno.FireLifetime, inferno.FireEffectTickBegin);
+                }
+            });
+        }
     }
 
     // ==================== 魔法子弹（!mb / mb）====================
@@ -2277,16 +2349,23 @@ public class XRayUnlockerPlugin : BasePlugin
         }
 
         // ===== 无限烟火（!inf）：持续维持烟雾与火焰 =====
-        // 说明：
-        // - 烟雾消散判定基于 (Server.TickCount - SmokeEffectTickBegin) 是否超过持续时间
-        //   因此对开启者丢出的烟雾，每帧把开始帧刷新为当前帧 → 永不进入消散计时；
-        // - 火焰寿命由 FireLifetime 控制，同时也会参考 FireEffectTickBegin 判定熄灭
-        //   开启时把寿命拉大并将开始帧刷新为当前帧 → 火焰永久燃烧；
-        // - 玩家关闭指令后，不再刷新 → 实体按照引擎正常时长自然消散（重新计时）
-        //   在消散前再次打开，实体仍有效，会被重新维持 → 达到“来得及就继续烧”的效果。
+        // 核心原理深入分析与多层锁止：
+        // 1. 烟雾弹（CSmokeGrenadeProjectile）：
+        //    - 客户端特效倒计时依赖 m_nSmokeEffectTickBegin：客户端根据 (CurrentTick - SmokeEffectTickBegin) 计算消散进度；
+        //    - 服务端内部 Think 决策依赖 NextThinkTick 与 DetonateTime：如果仅仅刷新 SmokeEffectTickBegin，服务端的
+        //      Think 函数在预定时间后依然会调用 Detonate/Expire/UTIL_Remove 将实体删除！
+        //    - 解决：同时不断推迟 NextThinkTick（当前帧 + 128）并刷新 SmokeEffectTickBegin 为当前帧，双重阻止消散与销毁。
+        // 2. 燃烧弹/火焰（CInferno）：
+        //    - 引擎不仅有 m_flFireLifetime 和 m_nFireEffectTickBegin，内部还有 ActiveTimer (IntervalTimer)
+        //      和 BookkeepingTimer (CountdownTimer)。
+        //    - 当 (CurrentTime - ActiveTimer.Timestamp) >= FireLifetime 时，内部逻辑就会判定火焰燃尽而销毁实体；
+        //    - 此外火焰还需要维持伤害判定（DamageTimer 不能无限推迟，否则火焰无伤害）。
+        //    - 解决：每帧重置 ActiveTimer.Timestamp 为 Server.CurrentTime（使已燃烧时间永远为 0），
+        //      将 FireLifetime 保持极大值，并保持 NextThinkTick 正常调度（保证火圈蔓延和烧人伤害正常计算）。
         if (hasInfiniteGrenade)
         {
             int nowTick = Server.TickCount;
+            float nowTime = Server.CurrentTime;
 
             if (_trackedSmokes.Count > 0)
             {
@@ -2303,9 +2382,15 @@ public class XRayUnlockerPlugin : BasePlugin
                     // 玩家已关闭 → 不做维持，让其自然倒计时直至消散
                     if (!_infiniteGrenadePlayers.Contains(kv.Value.Slot)) continue;
 
-                    // 将烟雾的开始帧刷到当前帧，烟雾永远处于“刚爆开”状态
+                    // 1. 刷新网络同步开始帧（客户端视觉永远在刚爆开状态）
                     smoke.SmokeEffectTickBegin = nowTick;
+                    // 2. 延后底层销毁 Think（阻止服务端调用 UTIL_Remove 销毁烟雾）
+                    smoke.NextThinkTick = nowTick + 128;
+                    // 3. 延后 DetonateTime
+                    smoke.DetonateTime = nowTime + 30f;
+
                     Utilities.SetStateChanged(smoke, "CSmokeGrenadeProjectile", "m_nSmokeEffectTickBegin");
+                    Utilities.SetStateChanged(smoke, "CBaseEntity", "m_nNextThinkTick");
                 }
             }
 
@@ -2324,11 +2409,30 @@ public class XRayUnlockerPlugin : BasePlugin
                     // 玩家已关闭 → 不做维持，让其自然倒计时直至熄灭
                     if (!_infiniteGrenadePlayers.Contains(kv.Value.Slot)) continue;
 
-                    // 拉大火焰寿命并把开始帧刷到当前帧 → 永不熄灭
+                    // 1. 拉大火焰寿命并刷新开始帧
                     inferno.FireLifetime = 999999.0f;
                     inferno.FireEffectTickBegin = nowTick;
+
+                    // 2. 重置燃烧起始时间戳（ActiveTimer 记录火燃烧了多久）
+                    // 只要让 ActiveTimer.Timestamp 永远紧跟当前时间，(now - Timestamp) 永远为 0，永不超时
+                    if (inferno.ActiveTimer != null)
+                    {
+                        inferno.ActiveTimer.Timestamp = nowTime;
+                    }
+
+                    // 3. 推迟簿记计时器（防止底层触发燃尽结算）
+                    if (inferno.BookkeepingTimer != null)
+                    {
+                        inferno.BookkeepingTimer.Timestamp = nowTime + 99999f;
+                        inferno.BookkeepingTimer.Duration = 99999f;
+                    }
+
+                    // 确保火正在燃烧标记不被置空
+                    inferno.InPostEffectTime = false;
+
                     Utilities.SetStateChanged(inferno, "CInferno", "m_flFireLifetime");
                     Utilities.SetStateChanged(inferno, "CInferno", "m_nFireEffectTickBegin");
+                    Utilities.SetStateChanged(inferno, "CInferno", "m_bInPostEffectTime");
                 }
             }
         }
