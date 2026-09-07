@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("StatTrakUnlocker")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+941586368e1b19560d30f6808dd2d3e467830e5e")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+295ab7d31bce6dae1bab54e6d56e4b4effc00d9e")]
 [assembly: System.Reflection.AssemblyProductAttribute("StatTrakUnlocker")]
 [assembly: System.Reflection.AssemblyTitleAttribute("StatTrakUnlocker")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
